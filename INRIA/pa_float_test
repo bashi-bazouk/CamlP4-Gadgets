@@ -1,0 +1,6 @@
+let x = Float.( 3/2 - sqrt (1/3) )
+let f x =
+  Float.( 
+    let pi = acos(-1) in
+    x/(2*pi) - x**(2/3)
+  )

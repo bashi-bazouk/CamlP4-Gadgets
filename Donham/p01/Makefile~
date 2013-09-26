@@ -1,0 +1,7 @@
+.PHONY: clean
+
+output: input.ml
+	camlp4of input.ml -printer o > output
+
+clean:
+	-rm output
