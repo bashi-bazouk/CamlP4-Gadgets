@@ -158,9 +158,9 @@ module Make (Syntax : Sig.Camlp4Syntax) = struct
     value curry_constr = init_curry_constr;
     value var_conversion = False;
 
-    method andsep : sep = "@]@ @[<2>and@ ";
+    method andsep : sep = "@]@ @[<2>def@ ";
     method value_val = "val";
-    method value_let = "let";
+    method value_let = "def";
 
     method semisep = semisep;
     method set_semisep s = {< semisep = s >};
@@ -183,7 +183,7 @@ module Make (Syntax : Sig.Camlp4Syntax) = struct
     method var f =
       fun
       [ ""   -> pp f "$lid:\"\"$"
-      | "[]" -> pp f "[]"
+      | "[]" -> pp f "Nil"
       | "()" -> pp f "()"
       | " True"  -> pp f "True"
       | " False" -> pp f "False"
@@ -201,7 +201,7 @@ module Make (Syntax : Sig.Camlp4Syntax) = struct
             | SYMBOL s ->
                 pp f "( %s )" s
             | LIDENT s | UIDENT s | ESCAPED_IDENT s ->
-                pp_print_string f (lc s)
+                pp_print_string f (cc s)
             | tok -> failwith (sprintf
                       "Bad token used as an identifier: %s"
                       (Token.to_string tok)) ] ] ];
@@ -209,8 +209,7 @@ module Make (Syntax : Sig.Camlp4Syntax) = struct
     method type_var f = 
       fun
       [ ""   -> pp f "$lid:\"\"$"
-      | "[]" -> pp f "[]"
-      | "()" -> pp f "()"
+      | "()" -> pp f "Unit"
       | " True"  -> pp f "True"
       | " False" -> pp f "False"
       | v ->
@@ -286,7 +285,7 @@ module Make (Syntax : Sig.Camlp4Syntax) = struct
     method match_case f =
       fun
       [ <:match_case@_loc<>> ->
-          pp f "@[<2>@ _ ->@ %a@]" o#raise_match_failure _loc
+          pp f "@[<2>@ case _ =>@ %a@]" o#raise_match_failure _loc
       | a -> o#match_case_aux f a ];
 
     method match_case_aux f =
@@ -296,9 +295,9 @@ module Make (Syntax : Sig.Camlp4Syntax) = struct
       | <:match_case< $a1$ | $a2$ >> ->
           pp f "%a%a" o#match_case_aux a1 o#match_case_aux a2
       | <:match_case< $p$ -> $e$ >> ->
-          pp f "@ | @[<2>%a@ ->@ %a@]" o#patt p o#under_pipe#expr e
+          pp f "@ case @[<2>%a@ =>@ %a@]" o#patt p o#under_pipe#expr e
       | <:match_case< $p$ when $w$ -> $e$ >> ->
-          pp f "@ | @[<2>%a@ when@ %a@ ->@ %a@]"
+          pp f "@ case @[<2>%a@ when@ %a@ =>@ %a@]"
             o#patt p o#under_pipe#expr w o#under_pipe#expr e ];
 
     method fun_binding f =
@@ -319,10 +318,10 @@ module Make (Syntax : Sig.Camlp4Syntax) = struct
             | _ -> expr_fun_args e ] in
           match (p, e) with
           [ (<:patt< $lid:_$ >>, <:expr< ($e$ : $t$) >>) ->
-              pp f "%a :@ %a =@ %a"
+              pp f "%a :@ %a =@ {@\n %a }"
                 (list o#fun_binding "@ ") [`patt p::pl] o#ctyp t o#expr e
-          | _ -> pp f "%a @[<0>%a=@]@ %a" o#simple_patt
-                    p (list' o#fun_binding "" "@ ") pl o#expr e ]
+          | _ -> pp f "%a@[<0>(%a) = {@]@ %a @\n}@\n" o#simple_patt
+                    p (list' o#fun_binding ", " "") pl o#expr e ]
       | <:binding< $anti:s$ >> -> o#anti f s ];
 
     method record_binding f bi =
@@ -474,14 +473,14 @@ module Make (Syntax : Sig.Camlp4Syntax) = struct
         if (not curry_constr) && Ast.is_expr_constructor a then
           match al with
           [ [ <:expr< ($tup:_$) >> ] ->
-              pp f "@[<2>%a@ (%a)@]" o#apply_expr x o#expr y
-          | [_] -> pp f "@[<2>%a@ %a@]" o#apply_expr x o#apply_expr y
+              pp f "@[<2>%a(%a)@]" o#apply_expr x o#expr y
+          | [_] -> pp f "@[<2>%a(%a)@]" o#apply_expr x o#apply_expr y
           | al ->
-              pp f "@[<2>%a@ (%a)@]" o#apply_expr a
+              pp f "@[<2>%a(%a)@]" o#apply_expr a
                  (* The #apply_expr below may put too much parens.
                     However using #expr would be wrong: PR#5056. *)
                  (list o#under_pipe#apply_expr ",@ ") al ]
-        else pp f "@[<2>%a@]" (list o#apply_expr "@ ") [a::al]
+        else pp f "@[<2>%a(%a)@]" o#apply_expr a (list o#apply_expr ",@ ") al
     | <:expr< $e1$.val := $e2$ >> ->
         pp f "@[<2>%a :=@ %a@]" o#dot_expr e1 o#expr e2
     | <:expr< $e1$ := $e2$ >> ->
@@ -493,24 +492,24 @@ module Make (Syntax : Sig.Camlp4Syntax) = struct
     | <:expr< fun (type $i$) -> $e$ >> ->
         pp f "@[<2>fun@ %a@]" o#patt_expr_fun_args (`newtype i, e)
     | <:expr< fun [ $a$ ] >> ->
-        pp f "@[<hv0>function%a@]" o#match_case a
+        pp f "@[<hv0>_ match { %a }@]" o#match_case a
     | <:expr< if $e1$ then $e2$ else $e3$ >> ->
-        pp f "@[<hv0>@[<2>if@ %a@]@ @[<2>then@ %a@]@ @[<2>else@ %a@]@]"
+        pp f "@[<hv0>@[<2>if(%a)@]@ {@[<2>@ %a@] } else @[<2>{@ %a }@]@]"
            o#expr e1 o#under_semi#expr e2 o#under_semi#expr e3
     | <:expr< lazy $e$ >> -> pp f "@[<2>lazy@ %a@]" o#simple_expr e
     | <:expr< let $rec:r$ $bi$ in $e$ >> ->
         match e with
         [ <:expr< let $rec:_$ $_$ in $_$ >> ->
-            pp f "@[<0>@[<2>let %a%a in@]@ %a@]"
-              o#rec_flag r o#binding bi o#reset_semi#expr e
+            pp f "@[<0>@[<2>def %a@]@ %a@]"
+               o#binding bi o#reset_semi#expr e
         | _ ->
-            pp f "@[<hv0>@[<2>let %a%a@]@ @[<hv2>in@ %a@]@]"
-              o#rec_flag r o#binding bi o#reset_semi#expr e ]
+            pp f "@[<hv0>@[<2>def %a@]@ @[<hv2>%a@]@]"
+               o#binding bi o#reset_semi#expr e ]
     | <:expr< let open $i$ in $e$ >> ->
         pp f "@[<2>let open %a@]@ @[<2>in@ %a@]"
              o#ident i o#reset_semi#expr e
     | <:expr< match $e$ with [ $a$ ] >> ->
-        pp f "@[<hv0>@[<hv0>@[<2>match %a@]@ with@]%a@]"
+        pp f "@[<hv0>@[<hv0>@[<2>%a match@]@ { @]%a }@]"
           o#expr e o#match_case a
     | <:expr< try $e$ with [ $a$ ] >> ->
         pp f "@[<0>@[<hv2>try@ %a@]@ @[<0>with%a@]@]"
@@ -541,9 +540,9 @@ module Make (Syntax : Sig.Camlp4Syntax) = struct
     [ <:expr< $e$.val >> -> pp f "@[<2>!@,%a@]" o#simple_expr e
     | <:expr< $e1$ . $e2$ >> -> pp f "@[<2>%a.@,%a@]" o#dot_expr e1 o#dot_expr e2
     | <:expr< $e1$ .( $e2$ ) >> ->
-        pp f "@[<2>%a.@,(%a)@]" o#dot_expr e1 o#expr e2
+        pp f "@[<2>%a@,(%a)@]" o#dot_expr e1 o#expr e2
     | <:expr< $e1$ .[ $e2$ ] >> ->
-        pp f "%a.@[<1>[@,%a@]@,]" o#dot_expr e1 o#expr e2
+        pp f "%a@[<1>(@,%a@)@,]" o#dot_expr e1 o#expr e2
     | <:expr< $e$ # $s$ >> -> pp f "@[<2>%a#@,%s@]" o#dot_expr e s
     | e -> o#simple_expr f e ];
 
@@ -566,8 +565,8 @@ module Make (Syntax : Sig.Camlp4Syntax) = struct
         pp f "@[<2>(%a :@ %a)@]" o#expr e o#ctyp t
     | <:expr< $anti:s$ >> -> o#anti f s
     | <:expr< for $s$ = $e1$ $to:df$ $e2$ do { $e3$ } >> ->
-        pp f "@[<hv0>@[<hv2>@[<2>for %a =@ %a@ %a@ %a@ do@]@ %a@]@ done@]"
-          o#var s o#expr e1 o#direction_flag df o#expr e2 o#seq e3
+        pp f "@[<hv0>@[<hv2>@[<2>for(%a <-@ Range(%a,@ %a))@ {@]@ %a@]@ }@]"
+          o#var s o#expr e1 o#expr e2 o#seq e3
     | <:expr< $int:s$ >> -> o#numeric f s ""
     | <:expr< $nativeint:s$ >> -> o#numeric f s "n"
     | <:expr< $int64:s$ >> -> o#numeric f s "L"
@@ -643,8 +642,8 @@ module Make (Syntax : Sig.Camlp4Syntax) = struct
     [ <:patt< [$_$ :: $_$] >> as p ->
         let (pl, c) = o#mk_patt_list p in
         match c with
-        [ None -> pp f "@[<2>[@ %a@]@ ]" (list o#patt ";@ ") pl
-        | Some x -> pp f "@[<2>%a@]" (list o#patt5 " ::@ ") (pl @ [x]) ]
+        [ None -> pp f "@[<2>List(%a) @]" (list o#patt ",@ ") pl
+        | Some x -> pp f "@[<2>%a::List(%a)@]" (list o#patt5 " ::@ ") pl o#patt5 x]
     | p -> o#patt5 f p ];
 
     method patt5 f = fun
@@ -676,7 +675,7 @@ module Make (Syntax : Sig.Camlp4Syntax) = struct
     | <:patt< ( $tup:p$ ) >> -> pp f "@[<1>(%a)@]" o#patt3 p
     | <:patt< { $p$ } >> -> pp f "@[<hv2>{@ %a@]@ }" o#patt p
     | <:patt< $str:s$ >> -> pp f "\"%s\"" s
-    | <:patt< ( $p$ : $t$ ) >> -> pp f "@[<1>(%a :@ %a)@]" o#patt p o#ctyp t
+    | <:patt< ( $p$ : $t$ ) >> -> pp f "@[<1>%a :@ %a@]" o#patt p o#ctyp t (* HERE *)
     | <:patt< $nativeint:s$ >> -> o#numeric f s "n"
     | <:patt< $int64:s$ >> -> o#numeric f s "L"
     | <:patt< $int32:s$ >> -> o#numeric f s "l"
@@ -884,7 +883,7 @@ module Make (Syntax : Sig.Camlp4Syntax) = struct
       | <:str_item< value $rec:r$ $bi$ >> ->
             pp f "@[<2>%s %a%a%(%)@]" o#value_let o#rec_flag r o#binding bi semisep
       | <:str_item< $exp:e$ >> ->
-            pp f "@[<2>let _ =@ %a%(%)@]" o#expr e semisep
+            pp f "@[<2>def _ =@ %a%(%)@]" o#expr e semisep
       | <:str_item< include $me$ >> ->
             pp f "@[<2>include@ %a%(%)@]" o#simple_module_expr me semisep
       | <:str_item< class type $ct$ >> ->

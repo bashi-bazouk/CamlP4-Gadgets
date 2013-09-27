@@ -1,2804 +1,1315 @@
-(*** Module that handles the process top level representation ***)
-open Namegen;;
-open Piastnode;;
-open Equations;;
+(*** Module that implements the model checking algorithm ***)
+
+open Namegen
+open Piastnode
+open Ccastnode
+open Equations
+open Process
+open Iterator
+open Formastnode
+open Mcmenu
+
 (***)
-exception False;;
-exception Found;;
-exception Error;;
-exception Found_fn;;
+
+exception Undeclared of string
+exception Wrong_args of string
+exception ErrorMsg of string
+exception UnguardedRec of string
+exception MaxThreads
+
 (***)
-(* Top level process name type *)
-type name = | Fname of string | Bname of string | Iname of int;;
-(* Top level process action type *)
-type top_act =
-  { t : Equations.action_type; sub : name; obj : name list; cont : eqvar;
-    args : name list
-  };;
-(* Top level process action set type *)
-type top_act_set = top_act array;;
-(* Top level process internal action type *)
-type top_tau = { tau_cont : eqvar; tau_args : name list };;
-(* Top level process internal action set type *)
-type top_tau_set = top_tau array;;
-(* Top level process test prefix type *)
-type top_test =
-  { tst : Equations.test_type; idl : name; idr : name; tcont : eqvar;
-    targs : name list
-  };;
-(* Top level process test prefix set type *)
-type top_test_set = top_test array;;
-(* Top level process sum type *)
-type top_sum = ((top_act list) * (top_tau list) * (top_test list));;
-(* Top level process sum set type *)
-type top_sum_set = top_sum list;;
-(* Top level process component type *)
-type component =
-  { nrests : int; rests : name array; nfnouts : int; nbnouts : int;
-    nfninps : int; nbninps : int; ntests : int; ntaus : int; nsums : int;
-    fn_outs : top_act_set; bn_outs : top_act_set; fn_inps : top_act_set;
-    bn_inps : top_act_set; id_tests : top_test_set; act_taus : top_tau_set;
-    act_sums : top_sum_set
-  };;
-(* Top level process structure type *)
-type process_cel =
-  { n_comps : int; comps : (component ref) array; env : eq_system;
-    fns : eq_fns
-  };;
-(*** Top level process type ***)
-type process = process_cel ref;;
+
+(* Fixpoint type *)
+
+type fixpoints = Max | Min
+
 (***)
-(* Action kind type *)
-type act_kind =
-  | ActK of top_act | TestK of top_test | SumK of top_sum | TauK of top_tau;;
-(*** Top level process label type ***)
-type label = (Equations.action_type * string * (string list));;
+
+(* Data structures that handle process representations *)
+
+let astprocs = ref (Hashtbl.create 100)
+let printprocs = ref []
+let ccprocs = ref []
+let cdlspecs = ref []
+let procs = ref (Hashtbl.create 100)
+
+(* Data structures that handle formula representations *)
+
+let printforms = ref []
+let forms = ref (Hashtbl.create 100)
+
+(* Model checker's user configurable parameters *)
+
+let trace_value = ref false
+let max_threads = ref 50
+let show_time = ref false
+let show_checkcounter = ref false
+let show_states = false
+let show_counter = ref 0
+let check_counter = ref 0
+
 (***)
-(* Auxiliar functions to print_process *)
-let print_name n =
-  match n with
-  | Bname s -> print_string ("bn(" ^ (s ^ ")"))
-  | Fname s -> print_string ("fn(" ^ (s ^ ")"))
-  | Iname i -> print_string ("in(" ^ ((string_of_int i) ^ ")"));;
-let rec print_nameL l =
+
+(* Auxiliar function to print_procs *)
+
+let rec print_names l = 
   match l with
-  | [] -> ignore l
-  | [ hd ] -> print_name hd
-  | hd :: tl -> (print_name hd; print_string ","; print_nameL tl);;
-let print_top_act act =
-  (print_name act.sub;
-   if act.t = Out_type then print_string "!(" else print_string "?(";
-   print_nameL act.obj;
-   print_string ").";
-   print_eqvar act.cont;
-   print_string "(";
-   print_nameL act.args;
-   print_string ")\n");;
-let print_top_tau tau =
-  (print_string "tau.";
-   print_eqvar tau.tau_cont;
-   print_string "(";
-   print_nameL tau.tau_args;
-   print_string ")\n");;
-let print_top_test test =
-  (print_string "[";
-   print_name test.idl;
-   if test.tst = Equals_type then print_string "=" else print_string "!=";
-   print_name test.idr;
-   print_string "].";
-   print_eqvar test.tcont;
-   print_string "(";
-   print_nameL test.targs;
-   print_string ")\n");;
-let rec print_top_acts_sum s =
-  match s with
-  | [] -> ignore s
-  | [ hd ] -> print_top_act hd
-  | hd :: tl -> (print_top_act hd; print_string "+ "; print_top_acts_sum tl);;
-let rec print_top_taus_sum s =
-  match s with
-  | [] -> ignore s
-  | [ hd ] -> print_top_tau hd
-  | hd :: tl -> (print_top_tau hd; print_string "+ "; print_top_taus_sum tl);;
-let rec print_top_tests_sum s =
-  match s with
-  | [] -> ignore s
-  | [ hd ] -> print_top_test hd
-  | hd :: tl ->
-      (print_top_test hd; print_string "+ "; print_top_tests_sum tl);;
-let rec print_top_sums sums =
-  match sums with
-  | [] -> ignore sums
-  | [ (acts, taus, tests) ] ->
-      (print_top_acts_sum acts;
-       if ((List.length acts) > 0) && ((List.length taus) > 0)
-       then print_string "+ "
-       else ();
-       print_top_taus_sum taus;
-       if
-         (((List.length acts) + (List.length taus)) > 0) &&
-           ((List.length tests) > 0)
-       then print_string "+ "
-       else ();
-       print_top_tests_sum tests)
-  | (acts, taus, tests) :: tl ->
-      (print_top_acts_sum acts;
-       if ((List.length acts) > 0) && ((List.length taus) > 0)
-       then print_string "+ "
-       else ();
-       print_top_taus_sum taus;
-       if
-         (((List.length acts) + (List.length taus)) > 0) &&
-           ((List.length tests) > 0)
-       then print_string "+ "
-       else ();
-       print_top_tests_sum tests;
-       print_newline ();
-       print_top_sums tl);;
+    [] -> print_string ""
+  | hd::[] -> print_string hd
+  | hd::tl -> print_string (hd^","); print_names tl
+
+let rec print_ands idL paramL pL visited =
+  match idL with
+    [] -> print_string ";\n"
+  | hd::tl -> 
+      if (Hashtbl.mem visited hd) then
+	print_ands tl (List.tl paramL) (List.tl pL) visited
+      else
+	(Hashtbl.add visited hd true;
+	 print_string ("\nand "^hd);
+	 if (List.length (List.hd paramL)) > 0 then
+	   (print_string "(";
+	    print_names (List.hd paramL);
+	    print_string ")");
+	 print_string " = ";
+	 print_ast (List.hd pL);
+	 print_ands tl (List.tl paramL) (List.tl pL) visited)
+
+let rec print_procs_aux l visited =
+  match l with
+    [] -> ignore l
+  | (id,dec)::tl ->
+      if Hashtbl.mem visited id then
+	print_procs_aux tl visited
+      else
+	(match dec with Pidec(ids, params, ps) ->
+	  List.iter (fun id_proc -> Hashtbl.add visited id_proc true) ids;
+	  print_procs_aux tl visited;
+	  print_string ("defproc "^id);
+	  if List.length (List.hd params) > 0 then
+	    (print_string "(";
+	     print_names (List.hd params);
+	     print_string ")");
+	  print_string " = ";
+	  print_ast (List.hd ps);
+	  List.iter (fun id_proc -> Hashtbl.remove visited id_proc) ids;
+	  print_ands (List.tl ids) (List.tl params) (List.tl ps) visited)
+
+(*** Prints the declared processes to stdout ***)
+	  
+let print_procs () =
+  print_procs_aux (!printprocs) (Hashtbl.create (List.length !printprocs))
+
 (***)
-let print_component comp =
-  (print_string "- COMP -\nrestricted: ";
-   for i = 0 to !comp.nrests - 1 do
-     print_name !comp.rests.(i);
-     print_string " "
-   done;
-   print_string "\nfnouts: ";
-   print_int !comp.nfnouts;
-   print_newline ();
-   for i = 0 to !comp.nfnouts - 1 do print_top_act !comp.fn_outs.(i) done;
-   print_string "fninps: ";
-   print_int !comp.nfninps;
-   print_newline ();
-   for i = 0 to !comp.nfninps - 1 do print_top_act !comp.fn_inps.(i) done;
-   print_string "bnouts: ";
-   print_int !comp.nbnouts;
-   print_newline ();
-   for i = 0 to !comp.nbnouts - 1 do print_top_act !comp.bn_outs.(i) done;
-   print_string "bninps: ";
-   print_int !comp.nbninps;
-   print_newline ();
-   for i = 0 to !comp.nbninps - 1 do print_top_act !comp.bn_inps.(i) done;
-   print_string "taus: ";
-   print_int !comp.ntaus;
-   print_newline ();
-   for i = 0 to !comp.ntaus - 1 do print_top_tau !comp.act_taus.(i) done;
-   print_string "tests: ";
-   print_int !comp.ntests;
-   print_newline ();
-   for i = 0 to !comp.ntests - 1 do print_top_test !comp.id_tests.(i) done;
-   print_string "sums: ";
-   print_int !comp.nsums;
-   print_newline ();
-   print_top_sums !comp.act_sums);;
-(*** Prints a top level process ***)
-let print_process p =
-  (print_string "*** PROCESS ***\n";
-   for i = 0 to (Array.length !p.comps) - 1 do print_component !p.comps.(i)
-   done;
-   print_string "***************\n");;
+
+(* Auxiliar functions to print_proc *)
+
+let rec print_proc_ands id_proc idL paramL pL =
+  match idL with
+    [] -> false
+  | hd::tl -> 
+      if hd = id_proc then
+	(print_string ("\ndefproc "^hd);
+	 if (List.length (List.hd paramL)) > 0 then
+	   (print_string "(";
+	    print_names (List.hd paramL);
+	    print_string ")");
+	 print_string " = ";
+	 print_ast (List.hd pL);
+	 print_newline();
+	 true)
+      else
+	print_proc_ands id_proc tl (List.tl paramL) (List.tl pL)
+
+let rec print_proc_aux id_proc l =
+  match l with
+    [] -> false
+  | (id,dec)::tl -> 
+      if id = id_proc then
+	(match dec with Pidec(ids, params, ps) ->
+	  print_string ("\ndefproc "^id);
+	  if List.length (List.hd params) > 0 then
+	    (print_string "(";
+	     print_names (List.hd params);
+	     print_string ")");
+	  print_string " = ";
+	  print_ast (List.hd ps);
+	  print_newline();
+	  true)
+      else
+	(match dec with Pidec(ids,params,ps) ->
+	  if print_proc_ands id_proc (List.tl ids) (List.tl params) (List.tl ps) then
+	    true
+	  else
+	    print_proc_aux id_proc tl)
+
+(* Prints a process to stdout given it's identifier *)
+
+let print_proc id =
+  print_proc_aux id !printprocs
+
+let rec print_ids l =
+match l with [] -> print_string ""
+| hd::[] -> print_string (hd^",")
+| hd::tl -> print_string (hd^","); print_ids tl
+
+let rec print_ccproc id_proc l =
+  match l with
+    [] -> false
+  | (id,args, ast)::tl -> 
+      if id = id_proc then
+	  (print_string ("\ndefproc cc "^id^"(");
+	  print_ids args;
+	  print_string ") = ";
+	  print_newline();
+	  print_ccast ast;
+	  print_newline();
+	  true)
+      else
+	(print_ccproc id_proc tl)
+
+
 (***)
+
+(* Auxiliar functions to install_proc *)
+
+let defproc id nf =
+  if (Hashtbl.mem !procs id) then 
+    Hashtbl.replace !procs id nf
+  else
+    Hashtbl.add (!procs) id nf
+
+let undefproc id =
+  if (Hashtbl.mem !procs id) then
+    Hashtbl.remove !procs id
+
+let rec install_p idL paramL h =
+  match idL with
+    [] -> ignore idL
+  | hd::tl ->
+      defproc hd (normalform hd (List.hd paramL) h);
+      install_p tl (List.tl paramL) h
+
+let rec uninstall_p idL p_id =
+  match idL with
+    [] -> ignore idL
+  | hd::tl ->
+      if hd = p_id then
+	ignore idL
+      else
+	(undefproc hd;
+	 uninstall_p tl p_id)
+
+(***)
+
+let rec create_env h idL paramL pL =
+  match idL with
+    [] -> ignore idL
+  | hd::tl ->
+      if Hashtbl.mem !h hd then 
+	Hashtbl.replace !h hd (List.hd paramL, List.hd pL)
+      else
+	Hashtbl.add (!h) hd (List.hd paramL , List.hd pL);
+      create_env h tl (List.tl paramL) (List.tl pL)
+
+let rec destroy_env h idL =
+  match idL with
+    [] -> ignore idL
+  | hd::tl -> Hashtbl.remove !h hd; destroy_env h tl
+
+(***)
+
+let rec check_unguarded_ast ast env p_id visited =
+  match !ast with
+    Piastnode.Void -> 
+      ignore ast
+  | Piastnode.Par(p1,p2) ->
+      check_unguarded_ast p1 env p_id visited;
+      check_unguarded_ast p2 env p_id visited
+  | Piastnode.Sum(p1,p2) ->
+      ignore ast
+  | Piastnode.New(nl,p) ->
+      check_unguarded_ast p env p_id visited
+  | Piastnode.Act(_,_) ->
+      ignore ast
+  | Piastnode.Test(id1,id2,p,typ) ->
+      ignore ast
+  | Piastnode.Var(id,al) ->
+      if id = p_id then
+	raise (UnguardedRec p_id)
+      else
+	(if not (Hashtbl.mem visited id) then
+	  (try
+	    let (pL,p) = Hashtbl.find !env id in
+	    Hashtbl.add visited id true;
+	    check_unguarded_ast p env p_id visited
+	  with Not_found -> raise (Equations.UndeclaredId id)))
+	  
+let rec check_unguarded h idL size =
+  match idL with
+    [] -> ignore idL
+  | hd::tl -> 
+      let (pL,p) = Hashtbl.find !h hd in
+      check_unguarded_ast p h hd (Hashtbl.create size);
+      check_unguarded h tl size
+
+(*** Installs the process declaration ***)
+
+let rec install_proc proc =
+  match proc with PIProcdec(Pidec(ids,params,ps)) ->
+    create_env astprocs ids params ps;
+    (try
+      check_unguarded astprocs ids (List.length ids)
+    with
+      UnguardedRec(x) -> (destroy_env astprocs ids; raise (UnguardedRec x))
+    | Equations.UndeclaredId(x) -> (destroy_env astprocs ids; raise (Equations.UndeclaredId x)));
+    (try
+      install_p ids params astprocs
+    with 
+      Equations.WrongNumArgs(x) ->
+	(destroy_env astprocs ids; 
+	 uninstall_p ids x;
+	 raise (Equations.WrongNumArgs x))
+    | Equations.UndeclaredId(x) -> 
+	(destroy_env astprocs ids;
+	 uninstall_p ids x;
+	 raise (Equations.UndeclaredId x)));
+    printprocs := (List.hd ids,Pidec(ids,params,ps))::!printprocs
+| CCProcdec(Ccdec(id, args,ccproc)) ->
+    let ccast = translate_ccast ccproc "up" "here" (Var(id,"up"::("here"::args))) in
+    install_proc (PIProcdec(Pidec([id],["up"::("here"::args)],[ccast])));
+    ccprocs := (id,args, ccproc)::!ccprocs
+
+
+(***)
+
+(* Auxiliar function to print_prop *) 
+	
+let rec print_props_aux l visited =
+  match l with
+    [] -> ignore l
+  | (id,ns,ps,form)::tl ->
+      if Hashtbl.mem visited id then
+	print_props_aux tl visited
+      else
+	(Hashtbl.add visited id true;
+	 print_props_aux tl visited;
+	 print_string ("defprop "^id);
+	 if (List.length ns > 0) || (List.length ps > 0) then
+	   (print_string "(";
+	    print_names ns;
+	    if (List.length ns > 0) && (List.length ps > 0) then
+	      print_string ", ";
+	    print_names ps;
+	    print_string ")");
+	 print_string " = ";
+	 print_form form;
+	 print_string ";\n")
+
+(*** Prints the declared formulas to stdout ***)
+
+let print_props () =
+  print_props_aux (!printforms) (Hashtbl.create (List.length !printforms))
+
+(***)
+
+(* Auxiliar function to print_prop *)
+
+let rec print_prop_aux id_form l =
+  match l with
+    [] -> false
+  | (id,ns,ps,form)::tl ->
+      if (id = id_form) then
+	(print_string ("\ndefprop "^id);
+	 if (List.length ns > 0) || (List.length ps > 0) then
+	   (print_string "(";
+	    print_names ns;
+	    if (List.length ns > 0) && (List.length ps > 0) then
+	      print_string ", ";
+	    print_names ps;
+	    print_string ")");
+	 print_string " = ";
+	 print_form form;
+	 print_newline();
+	 true)
+      else
+	print_prop_aux id_form tl
+
+(* Prints a formula to stdout given it's identifier *)
+
+let print_prop id =
+  print_prop_aux id !printforms
+
+(***)
+
+(* Auxiliar functions to install_prop *)
+
+let rec install_list l nh =
+  match l with
+    [] -> []
+  | hd::tl -> 
+      if hd = "_" then hd::(install_list tl nh)
+      else
+      (try 
+	   let r = Hashtbl.find (!nh) hd in
+	   r::(install_list tl nh)
+       with Not_found -> hd::(install_list tl nh))
+
+let install_lab l nh =
+  match l with
+    OutLab(s,sl) -> 
+      let ns = try Hashtbl.find (!nh) s with Not_found -> s in
+      OutLab(ns, install_list sl nh)
+  | InpLab(s,sl) -> 
+      let ns = try Hashtbl.find (!nh) s with Not_found -> s in
+      InpLab(ns, install_list sl nh)
+
+let pv_init = "#X"
+let pv_count = ref 0
+
+let fresh_pvar () =
+  let res = pv_init^(string_of_int !pv_count) in
+  incr pv_count;
+  res
+
+let rec install_form form nh ph =
+  match form with
+    True -> True
+  | False -> False
+  | Void -> Void
+  | NumComps(i,t) -> NumComps(i,t)
+  | Eq(id1,id2) ->
+      let nid1 = try Hashtbl.find (!nh) id1 with Not_found -> id1 in
+      let nid2 = try Hashtbl.find (!nh) id2 with Not_found -> id2 in
+      Eq(nid1,nid2)
+  | Neq(id1,id2) -> 
+      let nid1 = try Hashtbl.find (!nh) id1 with Not_found -> id1 in
+      let nid2 = try Hashtbl.find (!nh) id2 with Not_found -> id2 in
+      Neq(nid1,nid2)
+  | Not(f) -> Not(install_form f nh ph)
+  | And(f1,f2) -> And(install_form f1 nh ph, install_form f2 nh ph)
+  | Or(f1,f2) -> Or(install_form f1 nh ph, install_form f2 nh ph)
+  | Implies(f1,f2) -> Implies(install_form f1 nh ph, install_form f2 nh ph)
+  | Equiv(f1,f2) -> Equiv(install_form f1 nh ph, install_form f2 nh ph)
+  | Decomp(f1,f2) -> Decomp(install_form f1 nh ph, install_form f2 nh ph)
+  | Comp(f1,f2) -> Comp(install_form f1 nh ph, install_form f2 nh ph)
+  | Reveal(s,f) -> 
+      let ns = try Hashtbl.find (!nh) s with Not_found -> s in
+      Reveal(ns, install_form f nh ph)
+  | RevealAll(s,f) -> 
+      let ns = try Hashtbl.find (!nh) s with Not_found -> s in
+      RevealAll(ns, install_form f nh ph)
+  | Hidden(s,f) -> 
+      Hashtbl.add (!nh) s s;
+      let res = install_form f nh ph in
+      Hashtbl.remove (!nh) s;
+      Hidden(s,res)
+  | Fresh(s,f) ->
+      Hashtbl.add (!nh) s s;
+      let res = install_form f nh ph in
+      Hashtbl.remove (!nh) s;
+      Fresh(s,res)
+  | Free(s) ->
+      let ns = try Hashtbl.find (!nh) s with Not_found -> s in
+      Free(ns)
+  | MayTau(f) -> MayTau(install_form f nh ph)
+  | AllTau(f) -> AllTau(install_form f nh ph)
+  | MayLab(l,f) -> MayLab(install_lab l nh, install_form f nh ph)
+  | AllLab(l,f) -> AllLab(install_lab l nh, install_form f nh ph)
+  | MayOutN(n,f) -> 
+      let nn = try Hashtbl.find (!nh) n with Not_found -> n in
+      MayOutN(nn, install_form f nh ph)
+  | MayInpN(n,f) ->
+      let nn = try Hashtbl.find (!nh) n with Not_found -> n in
+      MayInpN(nn, install_form f nh ph)
+  | AllOutN(n,f) ->
+      let nn = try Hashtbl.find (!nh) n with Not_found -> n in
+      AllOutN(nn, install_form f nh ph)
+  | AllInpN(n,f) ->
+      let nn = try Hashtbl.find (!nh) n with Not_found -> n in
+      AllInpN(nn, install_form f nh ph)
+  | MayOut(f) -> MayOut(install_form f nh ph)
+  | MayInp(f) -> MayInp(install_form f nh ph)
+  | AllOut(f) -> AllOut(install_form f nh ph)
+  | AllInp(f) -> AllInp(install_form f nh ph)
+  | MayN(n,f) -> 
+      let nn = try Hashtbl.find (!nh) n with Not_found -> n in
+      MayN(nn, install_form f nh ph)
+  | AllN(n,f) ->
+      let nn = try Hashtbl.find (!nh) n with Not_found -> n in
+      AllN(nn, install_form f nh ph)
+  | May(f) -> May(install_form f nh ph)
+  | All(f) -> All(install_form f nh ph)
+  | Exists(n,f) ->
+      Hashtbl.add (!nh) n n;
+      let res = install_form f nh ph in
+      Hashtbl.remove (!nh) n;
+      Exists(n,res)
+  | ForAll(n,f) ->
+      Hashtbl.add (!nh) n n;
+      let res = install_form f nh ph in
+      Hashtbl.remove (!nh) n;
+      ForAll(n,res)
+  | MaxFix(x,params,f,args) ->
+      let fpv = fresh_pvar() in
+      Hashtbl.add (!ph) x (PropVar(fpv,[]));
+      List.iter (fun id -> Hashtbl.add !nh id id) params;
+      let res = install_form f nh ph in
+      List.iter (fun id -> Hashtbl.remove !nh id) params;
+      Hashtbl.remove (!ph) x;
+      MaxFix(fpv,params,res,install_list args nh)
+  | MinFix(x,params,f,args) ->
+      let fpv = fresh_pvar() in
+      Hashtbl.add (!ph) x (PropVar(fpv,[]));
+      List.iter (fun id -> Hashtbl.add !nh id id) params;
+      let res = install_form f nh ph in
+      List.iter (fun id -> Hashtbl.remove !nh id) params;
+      Hashtbl.remove (!ph) x;
+      MinFix(fpv,params,res,install_list args nh)
+  | Eventually(f) -> Eventually(install_form f nh ph)
+  | Always(f) -> Always(install_form f nh ph)
+  | Inside(f) -> Inside(install_form f nh ph)
+  | Show_f(f) -> Show_f(install_form f nh ph)
+  | Show_s(f) -> Show_s(install_form f nh ph)
+  | PropVar(p,args) ->
+      (try 
+	let res = Hashtbl.find (!ph) p in
+	(match res with
+	  PropVar(pvarname,pvarargs) ->
+	    (if List.length args > 0 then
+	      PropVar(pvarname,install_list args nh)
+	    else
+	      res)
+	| _ -> res)
+      with
+	Not_found -> raise Ill_formed_form)
+  | Abbrev(id, args) ->
+      raise Ill_formed_form
+
+let rec add_names h pl al =
+  match pl with
+    [] -> ignore pl
+  | hd::tl -> 
+      Hashtbl.add (!h) hd (List.hd al);
+      add_names h tl (List.tl al)
+
+let rec extract_args args i len1 len2 =
+  match args with
+    [] -> if i <> (len1+len2) then raise (Wrong_args "Number of arguments and parameters differ!") else ([],[])
+  | Abbrev(s,args)::tl ->
+      let (r1,r2) = extract_args tl (i+1) len1 len2 in 
+      if (i < len1) then 
+	(if (List.length args) > 0 then raise (Wrong_args "Wrong kind of argument!") else (s::r1, r2))
+      else
+	(r1, Abbrev(s,args)::r2)
+  | hd::tl ->
+      if (i < len1) then raise (Wrong_args "Wrong kind of argument!") else 
+      let (r1,r2) = extract_args tl (i+1) len1 len2 in
+      (r1, hd::r2)
+
+let rec install_defprop form ph =
+  match form with
+    True -> True
+  | False -> False
+  | Void -> Void
+  | NumComps(i,t) -> NumComps(i,t)
+  | Eq(id1,id2) -> Eq(id1,id2)
+  | Neq(id1,id2) -> Neq(id1,id2)
+  | Not(f) -> Not(install_defprop f ph)
+  | And(f1,f2) -> And(install_defprop f1 ph, install_defprop f2 ph)
+  | Or(f1,f2) -> Or(install_defprop f1 ph, install_defprop f2 ph)
+  | Implies(f1,f2) -> Implies(install_defprop f1 ph, install_defprop f2 ph)
+  | Equiv(f1,f2) -> Equiv(install_defprop f1 ph, install_defprop f2 ph)
+  | Decomp(f1,f2) -> Decomp(install_defprop f1 ph, install_defprop f2 ph)
+  | Comp(f1,f2) -> Comp(install_defprop f1 ph, install_defprop f2 ph)
+  | Reveal(s,f) -> Reveal(s, install_defprop f ph)
+  | RevealAll(s,f) -> RevealAll(s, install_defprop f ph)
+  | Fresh(s,f) -> Fresh(s, install_defprop f ph)
+  | Free(s) -> Free(s)
+  | Hidden(s,f) -> Hidden(s, install_defprop f ph)
+  | MayTau(f) -> MayTau(install_defprop f ph)
+  | AllTau(f) -> AllTau(install_defprop f ph)
+  | MayLab(l,f) -> MayLab(l, install_defprop f ph)
+  | AllLab(l,f) -> AllLab(l, install_defprop f ph)
+  | MayOutN(n,f) -> MayOutN(n, install_defprop f ph)
+  | MayInpN(n,f) -> MayInpN(n, install_defprop f ph)
+  | AllOutN(n,f) -> AllOutN(n, install_defprop f ph)
+  | AllInpN(n,f) -> AllInpN(n, install_defprop f ph)
+  | MayOut(f) -> MayOut(install_defprop f ph)
+  | MayInp(f) -> MayInp(install_defprop f ph)
+  | AllOut(f) -> AllOut(install_defprop f ph)
+  | AllInp(f) -> AllInp(install_defprop f ph)
+  | MayN(n,f) -> MayN(n,install_defprop f ph)
+  | AllN(n,f) -> AllN(n,install_defprop f ph)
+  | May(f) -> May(install_defprop f ph)
+  | All(f) -> All(install_defprop f ph)
+  | Exists(n,f) -> Exists(n, install_defprop f ph)
+  | ForAll(n,f) -> ForAll(n, install_defprop f ph)
+  | MaxFix(x,params,f,args) ->
+      (if (List.length params) <> (List.length args) then
+	raise (Wrong_args (x^": Number of arguments and parameters differ!")));
+      Hashtbl.add (!ph) x (List.length params);
+      let res = install_defprop f ph in
+      Hashtbl.remove (!ph) x;
+      MaxFix(x,params,res,args)
+  | MinFix(x,params,f,args) -> 
+      (if (List.length params) <> (List.length args) then
+	raise (Wrong_args (x^": Number of arguments and parameters differ!")));
+      Hashtbl.add (!ph) x (List.length params);
+      let res = install_defprop f ph in
+      Hashtbl.remove (!ph) x;
+      MinFix(x,params,res,args)
+  | Eventually(f) -> Eventually(install_defprop f ph)
+  | Always(f) -> Always(install_defprop f ph)
+  | Inside(f) -> Inside(install_defprop f ph)
+  | Show_f(f) -> Show_f(install_defprop f ph)
+  | Show_s(f) -> Show_s(install_defprop f ph)
+  | PropVar(p,args) ->
+      let npars = try Hashtbl.find (!ph) p with Not_found -> raise (Undeclared p) in
+      if npars <> (List.length args) then 
+	raise (Wrong_args (p^": Number of arguments and parameters differ!"))
+      else 
+	PropVar(p,args)
+  | Abbrev(id, args) ->
+      try
+	let (nparaml, pparaml, f) = Hashtbl.find (!forms) id in
+	let (nargs,pargs) = 
+	  extract_args args 0 (List.length nparaml) (List.length pparaml) in
+	let nameh = ref (Hashtbl.create (List.length nparaml)) in
+	add_names nameh nparaml nargs;
+	let proph = ref (Hashtbl.create (List.length pparaml)) in
+	add_props proph pparaml pargs ph;
+	install_form f nameh proph
+      with 
+	Not_found -> raise (Undeclared id)
+      | Wrong_args(x) -> raise (Wrong_args (id^": "^x))
+
+and add_props h pl al ph =
+  match pl with
+    [] -> ignore pl
+  | hd::tl ->
+      Hashtbl.add (!h) hd (install_defprop (List.hd al) ph);
+      add_props h tl (List.tl al) ph
+
+(***)
+
+let defprop id nparaml pparaml f =
+  let ph = ref (Hashtbl.create (List.length pparaml)) in
+  List.iter (fun id -> Hashtbl.add (!ph) id 0) pparaml;
+  let res = install_defprop f ph in
+  if Hashtbl.mem !forms id then 
+    Hashtbl.replace !forms id (nparaml, pparaml, res)
+  else
+    Hashtbl.add (!forms) id (nparaml, pparaml, res);
+  printforms := (id,nparaml,pparaml,f)::!printforms
+
+(*** Installs the formula declaration ***)
+
+let install_prop dec =
+  match dec with
+    Dec((id, ns, ps),f) -> defprop id ns ps f
+
+(***)
+
 (* Auxiliar functions *)
-let fresh_rests size =
-  let res = Array.create size ""
-  in (for i = 0 to size - 1 do res.(i) <- gen_bname () done; res);;
-(***)
-let get_string n = match n with | Bname s -> s | Fname s -> s | _ -> "";;
-let rec get_stringL nL =
-  match nL with | [] -> [] | hd :: tl -> (get_string hd) :: (get_stringL tl);;
-(***)
-let nil_component () =
-  {
-    nrests = 0;
-    rests = [|  |];
-    nfnouts = 0;
-    nbnouts = 0;
-    nfninps = 0;
-    nbninps = 0;
-    ntests = 0;
-    ntaus = 0;
-    nsums = 0;
-    fn_outs = [|  |];
-    bn_outs = [|  |];
-    fn_inps = [|  |];
-    bn_inps = [|  |];
-    id_tests = [|  |];
-    act_taus = [|  |];
-    act_sums = [];
-  };;
-(***)
-let new_component rL fnoL bnoL fniL bniL tests taus sums =
-  {
-    nrests = List.length rL;
-    rests = Array.of_list rL;
-    nfnouts = List.length fnoL;
-    nbnouts = List.length bnoL;
-    nfninps = List.length fniL;
-    nbninps = List.length bniL;
-    ntests = List.length tests;
-    ntaus = List.length taus;
-    nsums = List.length sums;
-    fn_outs = Array.of_list fnoL;
-    bn_outs = Array.of_list bnoL;
-    fn_inps = Array.of_list fniL;
-    bn_inps = Array.of_list bniL;
-    id_tests = Array.of_list tests;
-    act_taus = Array.of_list taus;
-    act_sums = sums;
-  };;
-(***)
-(* Auxiliar functions to handle component identification *)
-let rec get_comps a acts num_acts names num_names part j =
-  for k = 0 to num_acts - 1 do
-    if (acts.(k) = 0) && a.(k).(j)
-    then (acts.(k) <- part; get_names a acts num_acts names num_names part k)
-    else ()
-  done
-and get_names a acts num_acts names num_names part i =
-  for j = 0 to num_names - 1 do
-    if (names.(j) = 0) && a.(i).(j)
-    then
-      (names.(j) <- part; get_comps a acts num_acts names num_names part j)
-    else ()
-  done;;
-let comps a =
-  let num_acts = Array.length a in
-  let num_names = Array.length a.(0) in
-  let parts = ref 1 in
-  let acts = Array.create num_acts 0 in
-  let names = Array.create num_names 0
-  in
-    (for i = 0 to num_acts - 1 do
-       if acts.(i) = 0
-       then
-         (acts.(i) <- !parts;
-          get_names a acts num_acts names num_names !parts i;
-          incr parts)
-       else ()
-     done;
-     ((!parts - 1), acts, names));;
-(***)
-(* Auxiliar functions to handle top level process action creation *)
-let eq_name n marker pos sub_args sub_rests pars_marker =
-  match n with
-  | Rn i -> (marker.(pos).(i) <- true; Bname sub_rests.(i))
-  | Pn i ->
-      ((try
-          let k = Hashtbl.find !pars_marker (get_string sub_args.(i))
-          in marker.(pos).(k) <- true
-        with | Not_found -> ignore i);
-       sub_args.(i))
-  | Fn s -> Fname s
-  | In i -> Iname i;;
-let rec eq_nameL l marker pos sub_args sub_rests pars_marker =
-  match l with
-  | [] -> []
-  | hd :: tl ->
-      (eq_name hd marker pos sub_args sub_rests pars_marker) ::
-        (eq_nameL tl marker pos sub_args sub_rests pars_marker);;
-let eq_act act marker sub_args sub_rests pos pars_marker =
-  match act with
-  | (eq_t, s, o, x, a) ->
-      {
-        t = eq_t;
-        sub = eq_name s marker pos sub_args sub_rests pars_marker;
-        obj = eq_nameL o marker pos sub_args sub_rests pars_marker;
-        cont = x;
-        args = eq_nameL a marker pos sub_args sub_rests pars_marker;
-      };;
-let eq_test test marker sub_args sub_rests pos pars_marker =
-  match test with
-  | (typ, id1, id2, x, a) ->
-      {
-        tst = typ;
-        idl = eq_name id1 marker pos sub_args sub_rests pars_marker;
-        idr = eq_name id2 marker pos sub_args sub_rests pars_marker;
-        tcont = x;
-        targs = eq_nameL a marker pos sub_args sub_rests pars_marker;
-      };;
-let eq_tau tau marker sub_args sub_rests pos pars_marker =
-  match tau with
-  | (x, a) ->
-      {
-        tau_cont = x;
-        tau_args = eq_nameL a marker pos sub_args sub_rests pars_marker;
-      };;
-let eq_acts eq marker sub_args sub_rests start_act pars_marker start_outs
-            start_inps start_tests start_taus start_sums =
-  let outs = ref start_outs in
-  let accum = ref start_act
-  in
-    (for i = 0 to eq.num_fnouts - 1 do
-       outs :=
-         ((eq_act eq.fnouts.(i) marker sub_args sub_rests (!accum + i)
-             pars_marker),
-          (!accum + i)) :: !outs
-     done;
-     accum := !accum + eq.num_fnouts;
-     for i = 0 to eq.num_bnouts - 1 do
-       outs :=
-         ((eq_act eq.bnouts.(i) marker sub_args sub_rests (!accum + i)
-             pars_marker),
-          (!accum + i)) :: !outs
-     done;
-     accum := !accum + eq.num_bnouts;
-     let inps = ref start_inps
-     in
-       (for i = 0 to eq.num_fninps - 1 do
-          inps :=
-            ((eq_act eq.fninps.(i) marker sub_args sub_rests (!accum + i)
-                pars_marker),
-             (!accum + i)) :: !inps
-        done;
-        accum := !accum + eq.num_fninps;
-        for i = 0 to eq.num_bninps - 1 do
-          inps :=
-            ((eq_act eq.bninps.(i) marker sub_args sub_rests (!accum + i)
-                pars_marker),
-             (!accum + i)) :: !inps
-        done;
-        accum := !accum + eq.num_bninps;
-        let tests = ref start_tests
-        in
-          (for i = 0 to eq.num_tests - 1 do
-             tests :=
-               ((eq_test eq.tests.(i) marker sub_args sub_rests (!accum + i)
-                   pars_marker),
-                (!accum + i)) :: !tests
-           done;
-           accum := !accum + eq.num_tests;
-           let taus = ref start_taus
-           in
-             (for i = 0 to eq.num_taus - 1 do
-                taus :=
-                  ((eq_tau eq.taus.(i) marker sub_args sub_rests (!accum + i)
-                      pars_marker),
-                   (!accum + i)) :: !taus
-              done;
-              accum := !accum + eq.num_taus;
-              let sums = ref start_sums
-              in
-                (List.iter
-                   (fun l ->
-                      match l with
-                      | (s_acts, s_taus, s_tests) ->
-                          let sum_acts = ref []
-                          in
-                            (List.iter
-                               (fun act ->
-                                  sum_acts :=
-                                    (eq_act act marker sub_args sub_rests
-                                       !accum pars_marker) ::
-                                      !sum_acts)
-                               s_acts;
-                             let sum_tests = ref []
-                             in
-                               (List.iter
-                                  (fun test ->
-                                     sum_tests :=
-                                       (eq_test test marker sub_args
-                                          sub_rests !accum pars_marker) ::
-                                         !sum_tests)
-                                  s_tests;
-                                let sum_taus = ref []
-                                in
-                                  (List.iter
-                                     (fun tau ->
-                                        sum_taus :=
-                                          (eq_tau tau marker sub_args
-                                             sub_rests !accum pars_marker) ::
-                                            !sum_taus)
-                                     s_taus;
-                                   sums :=
-                                     (((!sum_acts), (!sum_taus),
-                                       (!sum_tests)),
-                                      (!accum)) :: !sums;
-                                   incr accum))))
-                   eq.sums;
-                 (outs, inps, tests, taus, sums))))));;
-(***)
-(* Auxiliar functions to handle top level process component creation *)
-let create_comps outs inps tests taus sums num_comps comp_acts =
-  let res_fnos = Array.create num_comps [] in
-  let res_bnos = Array.create num_comps [] in
-  let res_fnis = Array.create num_comps [] in
-  let res_bnis = Array.create num_comps [] in
-  let res_tests = Array.create num_comps [] in
-  let res_taus = Array.create num_comps [] in
-  let res_sums = Array.create num_comps [] in
-  let num_outs = List.length !outs in
-  let num_inps = List.length !inps in
-  let num_tests = List.length !tests in
-  let num_taus = List.length !taus
-  in
-    (for i = 0 to (Array.length comp_acts) - 1 do
-       if i < (num_outs + num_inps)
-       then
-         (let (act, act_pos, out) =
-            if i < num_outs
-            then
-              (let (res, act_pos) = List.hd !outs
-               in (outs := List.tl !outs; (res, act_pos, true)))
-            else
-              (let (res, act_pos) = List.hd !inps
-               in (inps := List.tl !inps; (res, act_pos, false))) in
-          let fn = match act.sub with | Bname s -> false | _ -> true
-          in
-            if fn
-            then
-              if out
-              then
-                res_fnos.(comp_acts.(act_pos) - 1) <-
-                  act :: res_fnos.(comp_acts.(act_pos) - 1)
-              else
-                res_fnis.(comp_acts.(act_pos) - 1) <-
-                  act :: res_fnis.(comp_acts.(act_pos) - 1)
-            else
-              if out
-              then
-                res_bnos.(comp_acts.(act_pos) - 1) <-
-                  act :: res_bnos.(comp_acts.(act_pos) - 1)
-              else
-                res_bnis.(comp_acts.(act_pos) - 1) <-
-                  act :: res_bnis.(comp_acts.(act_pos) - 1))
-       else
-         if i < ((num_outs + num_inps) + num_tests)
-         then
-           (let (test, test_pos) = List.hd !tests
-            in
-              (tests := List.tl !tests;
-               res_tests.(comp_acts.(test_pos) - 1) <-
-                 test :: res_tests.(comp_acts.(test_pos) - 1)))
-         else
-           if i < (((num_outs + num_inps) + num_tests) + num_taus)
-           then
-             (let (tau, tau_pos) = List.hd !taus
-              in
-                (taus := List.tl !taus;
-                 res_taus.(comp_acts.(tau_pos) - 1) <-
-                   tau :: res_taus.(comp_acts.(tau_pos) - 1)))
-           else
-             (let (sum, sum_pos) = List.hd !sums
-              in
-                (sums := List.tl !sums;
-                 res_sums.(comp_acts.(sum_pos) - 1) <-
-                   sum :: res_sums.(comp_acts.(sum_pos) - 1)))
-     done;
-     (res_fnos, res_bnos, res_fnis, res_bnis, res_tests, res_taus, res_sums));;
-let eq_rests comp_names num_comps sub_rests size res_names start_pos =
-  for i = 0 to size - 1 do
-    if comp_names.(i + start_pos) <> 0
-    then
-      res_names.(comp_names.(i + start_pos) - 1) <-
-        (Bname sub_rests.(i)) :: res_names.(comp_names.(i + start_pos) - 1)
-    else ()
-  done;;
-(***)
-(*** Creates a top level process from an equation system ***)
-let nf2process nf args =
-  match nf with
-  | (s, f, x, pars) ->
-      if is_void_eqvar x
-      then
-        (let res =
-           {
-             n_comps = 1;
-             comps = Array.create 1 (ref (nil_component ()));
-             env = nil_env ();
-             fns = nil_fns ();
-           }
-         in ref res)
+
+let lab_aux p l env =
+  match install_lab l env with 
+    InpLab(s,sl) -> react p (Lab(Inp_type,s,sl))
+  | OutLab(s,sl) -> react p (Lab(Out_type,s,sl))
+
+let rec merge l1 l2 =
+  match l2 with
+    [] -> l1
+  | hd::tl -> 
+      if List.mem hd l1 then
+	merge l1 tl
       else
-        (let eq = Hashtbl.find !s x in
-         let marker =
-           Array.make_matrix (count_acts eq) (count_rests eq) false in
-         let sub_args = Array.create (List.length args) (Fname "") in
-         let i = ref 0
-         in
-           (List.iter (fun s -> (sub_args.(!i) <- Fname s; incr i)) args;
-            let sub_rests = fresh_rests (count_rests eq) in
-            let (outs, inps, tests, taus, sums) =
-              eq_acts eq marker sub_args sub_rests 0 (ref (Hashtbl.create 0))
-                [] [] [] [] [] in
-            let (num_comps, comp_acts, comp_names) = comps marker in
-            let (fnoL, bnoL, fniL, bniL, id_ts, act_ts, act_ss) =
-              create_comps outs inps tests taus sums num_comps comp_acts in
-            let rL = Array.create num_comps []
-            in
-              (eq_rests comp_names num_comps sub_rests (count_rests eq) rL 0;
-               let res =
-                 {
-                   n_comps = num_comps;
-                   comps = Array.create num_comps (ref (nil_component ()));
-                   env = s;
-                   fns = f;
-                 }
-               in
-                 (for i = 0 to num_comps - 1 do
-                    res.comps.(i) <-
-                      ref
-                        (new_component rL.(i) fnoL.(i) bnoL.(i) fniL.(i)
-                           bniL.(i) id_ts.(i) act_ts.(i) act_ss.(i))
-                  done;
-                  ref res))));;
+	hd::(merge l1 tl)
+
+let rec domain_form l pvarsL env =
+  match pvarsL with
+    [] -> l
+  | hd::tl -> 
+      let res = domain_form l tl env in
+      try
+	let (_,_,_,supp,_,_) = Hashtbl.find !env hd in
+	merge res supp
+      with Not_found -> res
+
+let create_domains p f penv nenv =
+  let fnp = free_names p in
+  let (fnf_aux,pvars) = formFN f nenv in
+  let fnf = domain_form fnf_aux pvars penv in
+  let domain = fresh_name()::(merge fnf fnp) in
+  (domain,fnp)
+
 (***)
-(* Auxiliar functions to test_fn *)
-let test_fn_name n arg =
-  match n with | Fname s -> s = arg | Bname s -> false | Iname i -> false;;
-let rec test_fn_nameL l arg =
-  match l with
-  | [] -> false
-  | hd :: tl -> (test_fn_name hd arg) || (test_fn_nameL tl arg);;
-let test_fn_aux act n fnsub =
-  (fnsub && (test_fn_name act.sub n)) ||
-    (((act.t = Out_type) && (test_fn_nameL act.obj n)) ||
-       (test_fn_nameL act.args n));;
-(*** Tests if a process has a determined free name ***)
-let test_fn p n =
-  let i = ref 0 in
-  let j = ref 0 in
-  let res = ref false
-  in
-    (while (not !res) && (!i < !p.n_comps) do j := 0;
-       while (not !res) && (!j < !(!p.comps.(!i)).nfnouts) do
-         res := test_fn_aux !(!p.comps.(!i)).fn_outs.(!j) n true;
-         res :=
-           !res ||
-             (try
-                let fnL =
-                  Hashtbl.find !(!p.fns) !(!p.comps.(!i)).fn_outs.(!j).cont
-                in List.mem n !fnL
-              with | Not_found -> false);
-         incr j done;
-       j := 0;
-       while (not !res) && (!j < !(!p.comps.(!i)).nfninps) do
-         res := test_fn_aux !(!p.comps.(!i)).fn_inps.(!j) n true;
-         res :=
-           !res ||
-             (try
-                let fnL =
-                  Hashtbl.find !(!p.fns) !(!p.comps.(!i)).fn_inps.(!j).cont
-                in List.mem n !fnL
-              with | Not_found -> false);
-         incr j done;
-       j := 0;
-       while (not !res) && (!j < !(!p.comps.(!i)).nbnouts) do
-         res := test_fn_aux !(!p.comps.(!i)).bn_outs.(!j) n false;
-         res :=
-           !res ||
-             (try
-                let fnL =
-                  Hashtbl.find !(!p.fns) !(!p.comps.(!i)).bn_outs.(!j).cont
-                in List.mem n !fnL
-              with | Not_found -> false);
-         incr j done;
-       j := 0;
-       while (not !res) && (!j < !(!p.comps.(!i)).nbninps) do
-         res := test_fn_aux !(!p.comps.(!i)).bn_inps.(!j) n false;
-         res :=
-           !res ||
-             (try
-                let fnL =
-                  Hashtbl.find !(!p.fns) !(!p.comps.(!i)).bn_inps.(!j).cont
-                in List.mem n !fnL
-              with | Not_found -> false);
-         incr j done;
-       j := 0;
-       while (not !res) && (!j < !(!p.comps.(!i)).ntests) do
-         res := test_fn_name !(!p.comps.(!i)).id_tests.(!j).idl n;
-         res := !res || (test_fn_name !(!p.comps.(!i)).id_tests.(!j).idr n);
-         res :=
-           !res || (test_fn_nameL !(!p.comps.(!i)).id_tests.(!j).targs n);
-         res :=
-           !res ||
-             (try
-                let fnL =
-                  Hashtbl.find !(!p.fns) !(!p.comps.(!i)).id_tests.(!j).tcont
-                in List.mem n !fnL
-              with | Not_found -> false);
-         incr j done;
-       j := 0;
-       while (not !res) && (!j < !(!p.comps.(!i)).ntaus) do
-         res := test_fn_nameL !(!p.comps.(!i)).act_taus.(!j).tau_args n;
-         res :=
-           !res ||
-             (try
-                let fnL =
-                  Hashtbl.find !(!p.fns)
-                    !(!p.comps.(!i)).act_taus.(!j).tau_cont
-                in List.mem n !fnL
-              with | Not_found -> false);
-         incr j done;
-       (try
-          List.iter
-            (fun sum ->
-               match sum with
-               | (acts, taus, tests) ->
-                   (List.iter
-                      (fun act ->
-                         (if !res then raise Found_fn else ();
-                          res := !res || (test_fn_aux act n true);
-                          res :=
-                            !res ||
-                              (try
-                                 let fnL = Hashtbl.find !(!p.fns) act.cont
-                                 in List.mem n !fnL
-                               with | Not_found -> false)))
-                      acts;
-                    List.iter
-                      (fun tau ->
-                         (if !res then raise Found_fn else ();
-                          res := !res || (test_fn_nameL tau.tau_args n);
-                          res :=
-                            !res ||
-                              (try
-                                 let fnL =
-                                   Hashtbl.find !(!p.fns) tau.tau_cont
-                                 in List.mem n !fnL
-                               with | Not_found -> false)))
-                      taus;
-                    List.iter
-                      (fun test ->
-                         (if !res then raise Found_fn else ();
-                          res := test_fn_name test.idl n;
-                          res := !res || (test_fn_name test.idr n);
-                          res := !res || (test_fn_nameL test.targs n);
-                          res :=
-                            !res ||
-                              (try
-                                 let fnL = Hashtbl.find !(!p.fns) test.tcont
-                                 in List.mem n !fnL
-                               with | Not_found -> false)))
-                      tests))
-            !(!p.comps.(!i)).act_sums
-        with | Found_fn -> ignore 0);
-       incr i done;
-     !res);;
-(***)
-(* Auxiliar functions to free_names *)
-let free_name n h res =
-  match n with
-  | Fname s ->
-      if not (Hashtbl.mem !h s)
-      then (Hashtbl.add !h s 0; res := s :: !res)
-      else ()
-  | _ -> ignore n;;
-let rec free_nameL l h res =
-  match l with
-  | [] -> ignore l
-  | hd :: tl -> (free_name hd h res; free_nameL tl h res);;
-let rec fn_eqs_aux l h res =
-  match l with
-  | [] -> ignore l
-  | hd :: tl ->
-      (if not (Hashtbl.mem !h hd)
-       then (Hashtbl.add !h hd 0; res := hd :: !res)
-       else ();
-       fn_eqs_aux tl h res);;
-let fn_eqs p c h res =
-  try let fnL = Hashtbl.find !(!p.fns) c in fn_eqs_aux !fnL h res
-  with | Not_found -> ignore c;;
-(*** Returns the set of free names of a process ***)
-let free_names p =
-  let h = ref (Hashtbl.create 100) in
-  let res = ref []
-  in
-    (for i = 0 to !p.n_comps - 1 do
-       for j = 0 to !(!p.comps.(i)).nfnouts - 1 do
-         free_name !(!p.comps.(i)).fn_outs.(j).sub h res;
-         free_nameL !(!p.comps.(i)).fn_outs.(j).obj h res;
-         free_nameL !(!p.comps.(i)).fn_outs.(j).args h res;
-         fn_eqs p !(!p.comps.(i)).fn_outs.(j).cont h res
-       done;
-       for j = 0 to !(!p.comps.(i)).nfninps - 1 do
-         free_name !(!p.comps.(i)).fn_inps.(j).sub h res;
-         free_nameL !(!p.comps.(i)).fn_inps.(j).args h res;
-         fn_eqs p !(!p.comps.(i)).fn_inps.(j).cont h res
-       done;
-       for j = 0 to !(!p.comps.(i)).nbnouts - 1 do
-         free_nameL !(!p.comps.(i)).bn_outs.(j).obj h res;
-         free_nameL !(!p.comps.(i)).bn_outs.(j).args h res;
-         fn_eqs p !(!p.comps.(i)).bn_outs.(j).cont h res
-       done;
-       for j = 0 to !(!p.comps.(i)).nbninps - 1 do
-         free_nameL !(!p.comps.(i)).bn_inps.(j).args h res;
-         fn_eqs p !(!p.comps.(i)).bn_inps.(j).cont h res
-       done;
-       for j = 0 to !(!p.comps.(i)).ntests - 1 do
-         free_name !(!p.comps.(i)).id_tests.(j).idl h res;
-         free_name !(!p.comps.(i)).id_tests.(j).idr h res;
-         free_nameL !(!p.comps.(i)).id_tests.(j).targs h res;
-         fn_eqs p !(!p.comps.(i)).id_tests.(j).tcont h res
-       done;
-       for j = 0 to !(!p.comps.(i)).ntaus - 1 do
-         free_nameL !(!p.comps.(i)).act_taus.(j).tau_args h res;
-         fn_eqs p !(!p.comps.(i)).act_taus.(j).tau_cont h res
-       done;
-       List.iter
-         (fun sum ->
-            match sum with
-            | (acts, taus, tests) ->
-                (List.iter
-                   (fun act ->
-                      (free_name act.sub h res;
-                       if act.t = Out_type
-                       then free_nameL act.obj h res
-                       else ();
-                       free_nameL act.args h res;
-                       fn_eqs p act.cont h res))
-                   acts;
-                 List.iter
-                   (fun tau ->
-                      (free_nameL tau.tau_args h res;
-                       fn_eqs p tau.tau_cont h res))
-                   taus;
-                 List.iter
-                   (fun test ->
-                      (free_name test.idl h res;
-                       free_name test.idr h res;
-                       free_nameL test.targs h res;
-                       fn_eqs p test.tcont h res))
-                   tests))
-         !(!p.comps.(i)).act_sums
-     done;
-     !res);;
-(***)
-(*** Returns the number of components of a process ***)
-let num_comps p = !p.n_comps;;
-(***)
-(*** Determines if a process is empty ***)
-let empty_proc p =
-  ((num_comps p) = 1) &&
-    ((!(!p.comps.(0)).nrests = 0) &&
-       ((!(!p.comps.(0)).nfnouts = 0) &&
-          ((!(!p.comps.(0)).nfninps = 0) &&
-             ((!(!p.comps.(0)).nbnouts = 0) &&
-                ((!(!p.comps.(0)).nbninps = 0) &&
-                   ((!(!p.comps.(0)).ntests = 0) &&
-                      ((!(!p.comps.(0)).ntaus = 0) &&
-                         (!(!p.comps.(0)).nsums = 0))))))));;
-(***)
-(* Auxiliar function to total_acts *)
-let count_acts_comp p pos =
-  (((((!(!p.comps.(pos)).nfnouts + !(!p.comps.(pos)).nfninps) +
-        !(!p.comps.(pos)).nbnouts)
-       + !(!p.comps.(pos)).nbninps)
-      + !(!p.comps.(pos)).ntests)
-     + !(!p.comps.(pos)).ntaus)
-    + !(!p.comps.(pos)).nsums;;
-(*** Returns the number of actions of a process ***)
-let total_acts p =
-  let res = ref 0
-  in
-    (for i = 0 to !p.n_comps - 1 do res := !res + (count_acts_comp p i) done;
-     !res);;
-(***)
-(*** Builds two processes by separating an existing one ***)
-let extract_comps p is size dim1 dim2 =
-  let p1 =
-    {
-      n_comps = dim1;
-      comps = Array.create dim1 (ref (nil_component ()));
-      env = !p.env;
-      fns = !p.fns;
-    } in
-  let p2 =
-    {
-      n_comps = dim2;
-      comps = Array.create dim2 (ref (nil_component ()));
-      env = !p.env;
-      fns = !p.fns;
-    } in
-  let j = ref 0 in
-  let k = ref 0
-  in
-    (for i = 0 to size - 1 do
-       if List.mem i is
-       then (p1.comps.(!j) <- !p.comps.(i); incr j)
-       else (p2.comps.(!k) <- !p.comps.(i); incr k)
-     done;
-     ((ref p1), (ref p2)));;
-(***)
-(*** Builds a pair of processes by composing with the empty process ***)
-let comp_empty p left =
-  let empty =
-    {
-      n_comps = 1;
-      comps = Array.create 1 (ref (nil_component ()));
-      env = nil_env ();
-      fns = nil_fns ();
-    }
-  in if left then ((ref empty), p) else (p, (ref empty));;
-(***)
-(*** Returns the number of restrictions of a process component ***)
-let nrests_comp p pos = !(!p.comps.(pos)).nrests;;
-(***)
-(*** Finds a component that holds restrictions ***)
-let find_res p pos =
-  let found = ref false in
-  let i = ref pos in
-  let size = num_comps p
-  in
-    (while (!i < size) && (not !found) do
-       if !(!p.comps.(!i)).nrests > 0 then found := true else incr i done;
-     !i);;
-(***)
-(* Auxiliar functions to handle process updates *)
-let instantiate_proc p num_comps comp_num rL fnoL bnoL fniL bniL id_ts act_ts
-                     act_ss =
-  let size = (!p.n_comps + num_comps) - 1 in
-  let res =
-    {
-      n_comps = size;
-      comps = Array.create size (ref (nil_component ()));
-      env = !p.env;
-      fns = !p.fns;
-    }
-  in
-    (for i = 0 to size - 1 do
-       if i < comp_num
-       then res.comps.(i) <- !p.comps.(i)
-       else
-         if i < (!p.n_comps - 1)
-         then res.comps.(i) <- !p.comps.(i + 1)
-         else
-           res.comps.(i) <-
-             ref
-               (new_component rL.(i - (!p.n_comps - 1))
-                  fnoL.(i - (!p.n_comps - 1)) bnoL.(i - (!p.n_comps - 1))
-                  fniL.(i - (!p.n_comps - 1)) bniL.(i - (!p.n_comps - 1))
-                  id_ts.(i - (!p.n_comps - 1)) act_ts.(i - (!p.n_comps - 1))
-                  act_ss.(i - (!p.n_comps - 1)))
-     done;
-     ref res);;
-let instantiate_proc2 p num_comps comp1 comp2 rL fnoL bnoL fniL bniL id_ts
-                      act_ts act_ss =
-  let size = (!p.n_comps + num_comps) - 2 in
-  let res =
-    {
-      n_comps = size;
-      comps = Array.create size (ref (nil_component ()));
-      env = !p.env;
-      fns = !p.fns;
-    } in
-  let min_comp = min comp1 comp2 in
-  let max_comp = max comp1 comp2
-  in
-    (for i = 0 to size - 1 do
-       if i < min_comp
-       then res.comps.(i) <- !p.comps.(i)
-       else
-         if i < (max_comp - 1)
-         then res.comps.(i) <- !p.comps.(i + 1)
-         else
-           if i < (!p.n_comps - 2)
-           then res.comps.(i) <- !p.comps.(i + 2)
-           else
-             res.comps.(i) <-
-               ref
-                 (new_component rL.(i - (!p.n_comps - 2))
-                    fnoL.(i - (!p.n_comps - 2)) bnoL.(i - (!p.n_comps - 2))
-                    fniL.(i - (!p.n_comps - 2)) bniL.(i - (!p.n_comps - 2))
-                    id_ts.(i - (!p.n_comps - 2))
-                    act_ts.(i - (!p.n_comps - 2))
-                    act_ss.(i - (!p.n_comps - 2)))
-     done;
-     ref res);;
-(* Restricted name update identification *)
-let rest_marker comp start_rest pos rmarker =
-  let count = ref start_rest
-  in
-    for i = 0 to !comp.nrests - 1 do
-      if i <> pos
-      then
-        (Hashtbl.add !rmarker (get_string !comp.rests.(i)) !count;
-         incr count)
-      else ()
-    done;;
-(* Action update handling *)
-let proc_name arg oldn newn marker rmarker pos =
-  match arg with
-  | Bname s ->
-      if s = oldn
-      then Fname newn
+
+let rec fixpoint_args new_nenv params args =
+  match params with
+    [] -> ignore params
+  | hd::tl -> 
+      Hashtbl.add !new_nenv hd (List.hd args);
+      fixpoint_args new_nenv tl (List.tl args)
+
+let rec fixpoint_args_subst args nenv =
+  match args with
+    [] -> []
+  | hd::tl -> 
+      let nhd = try Hashtbl.find !nenv hd with Not_found -> hd in
+      nhd::(fixpoint_args_subst tl nenv)
+
+let rec arg_template args supp assocs =
+  match args with
+    [] -> ([],[])
+  | hd::tl ->
+      let (l1,l2) = arg_template tl supp assocs in
+      if List.mem hd supp then
+	(hd::l1,l2)
       else
-        (let k = Hashtbl.find !rmarker s
-         in (marker.(pos).(k) <- true; Bname s))
-  | Fname s -> Fname s
-  | Iname i -> Iname i;;
-let rec proc_nameL l oldn newn marker rmarker pos =
+	(let marker = try Hashtbl.find !assocs hd with Not_found -> gen_bname() in
+	(marker::l1,hd::l2))
+
+let rec match_template args template supp assocs =
+  match template with
+    [] -> (true,[])
+  | hd::tl -> 
+      let (ans,res) = match_template (List.tl args) tl supp assocs in
+      if not ans then (false,[])
+      else
+	(if not (is_bname hd) then 
+	  (hd = (List.hd args),res)
+	 else
+	  (if List.mem (List.hd args) supp then (false,[])
+	   else
+	     (let marker = 
+	      try 
+		Hashtbl.find !assocs (List.hd args) 
+	      with Not_found -> (Hashtbl.add !assocs (List.hd args) hd; hd)
+	     in
+	     (marker = hd,(List.hd args)::res))))
+
+(***)
+	  
+(* Model checker main algorithm *)
+
+let rec check p form nenv penv =
+  incr check_counter;
+  (if (total_acts p > !max_threads) then
+    raise MaxThreads);
+  match form with
+    True -> true
+  | False -> false
+  | Void -> empty_proc p
+  | NumComps(i,t) ->
+      (match t with
+	EqNum -> 
+	  if i = 1 then
+	    (not (empty_proc p)) && ((num_comps p) = 1)
+	  else
+	    (num_comps p) = i
+      | LtNum -> 
+	  if i = 0 then
+	    false
+	  else if i = 1 then
+	    empty_proc p
+	  else
+	    (num_comps p) < i
+      | GtNum -> (not (empty_proc p)) && (num_comps p) > i)
+
+      (***)
+
+  | Eq(id1,id2) ->
+      let nid1 = try Hashtbl.find (!nenv) id1 with Not_found -> id1 in
+      let nid2 = try Hashtbl.find (!nenv) id2 with Not_found -> id2 in
+      nid1 = nid2
+  | Neq(id1,id2) ->
+      let nid1 = try Hashtbl.find (!nenv) id1 with Not_found -> id1 in
+      let nid2 = try Hashtbl.find (!nenv) id2 with Not_found -> id2 in
+      nid1 <> nid2
+
+      (***)
+
+  | Not(f) -> not (check p f nenv penv)
+  | And(f1,f2) -> (check p f1 nenv penv) && (check p f2 nenv penv)
+  | Or(f1,f2) -> (check p f1 nenv penv) || (check p f2 nenv penv)
+  | Implies(f1,f2) -> (not (check p f1 nenv penv)) || (check p f2 nenv penv)
+  | Equiv(f1,f2) -> (((not (check p f1 nenv penv)) || (check p f2 nenv penv)) &&
+		     ((not (check p f2 nenv penv)) || (check p f1 nenv penv)))
+
+      (***)
+
+  | Decomp(f1,f2) -> not (comp_aux p f1 f2 nenv penv false)
+  | Comp(f1,f2) -> comp_aux p f1 f2 nenv penv true
+
+      (***)
+
+  | Reveal(s,f) ->
+      let n = (try Hashtbl.find (!nenv) s with Not_found -> s) in
+      reveal_aux p n f nenv penv true
+  | RevealAll(s,f) ->
+      let n = (try Hashtbl.find (!nenv) s with Not_found -> s) in
+      not (reveal_aux p n f nenv penv false)
+  | Fresh(s,f) ->
+      let fresh = fresh_name() in
+      Hashtbl.add (!nenv) s fresh;
+      let res = check p f nenv penv in
+      Hashtbl.remove (!nenv) s;
+      res
+  | Free(s) ->
+      let n = (try Hashtbl.find (!nenv) s with Not_found -> s) in
+      test_fn p n
+  | Hidden(s,f) ->
+      let fresh = fresh_name() in
+      Hashtbl.add (!nenv) s fresh;
+      let res = reveal_aux p fresh f nenv penv true in
+      Hashtbl.remove (!nenv) s;
+      res      
+  
+      (***)
+
+  | MayTau(f) ->
+      let tau_it = react p Tau in
+      next_aux p tau_it f nenv penv true
+  | AllTau(f) ->
+      let tau_it = react p Tau in
+      not (next_aux p tau_it f nenv penv false)
+  
+      (***)
+
+  | MayLab(l,f) ->
+      let lab_it = lab_aux p l nenv in
+      next_aux p lab_it f nenv penv true
+  | AllLab(l,f) ->
+      let lab_it = lab_aux p l nenv in
+      not (next_aux p lab_it f nenv penv false)
+  
+      (***)
+
+  | MayOutN(n,f) -> 
+      let nn = try Hashtbl.find (!nenv) n with Not_found -> n in
+      let name_it = react p (Name(nn,Out_type)) in
+      next_aux p name_it f nenv penv true
+  | AllOutN(n,f) -> 
+      let nn = try Hashtbl.find (!nenv) n with Not_found -> n in
+      let name_it = react p (Name(nn,Out_type)) in
+      not (next_aux p name_it f nenv penv false)
+  | MayOut(f) -> 
+      let action_it = react p (Action(Out_type)) in
+      next_aux p action_it f nenv penv true
+  | AllOut(f) -> 
+      let action_it = react p (Action(Out_type)) in
+      not (next_aux p action_it f nenv penv false)
+  
+      (***)
+
+  | MayInpN(n,f) ->
+      let (domain,_) = create_domains p (MayInpN(n,f)) penv nenv in
+      let nn = try Hashtbl.find (!nenv) n with Not_found -> n in
+      let lens = get_num_args p nn in
+      may_iter_obj_aux p nn f nenv penv domain lens
+  | AllInpN(n,f) -> 
+      let (domain,_) = create_domains p (AllInpN(n,f)) penv nenv in
+      let nn = try Hashtbl.find (!nenv) n with Not_found -> n in
+      let lens = get_num_args p nn in
+      all_iter_obj_aux p nn f nenv penv domain lens
+  | MayInp(f) -> 
+      let (domainObj, domainSub) = create_domains p f penv nenv in
+      may_iter_sub_aux p f nenv penv domainSub domainObj
+  | AllInp(f) ->
+      let (domainObj, domainSub) = create_domains p f penv nenv in
+      all_iter_sub_aux p f nenv penv domainSub domainObj
+
+	(***)
+
+  | MayN(n,f) ->
+      (check p (MayOutN(n,f)) nenv penv) ||
+      (check p (MayInpN(n,f)) nenv penv)
+  | AllN(n,f) ->
+      (check p (AllOutN(n,f)) nenv penv) &&
+      (check p (AllInpN(n,f)) nenv penv)
+
+	(***)
+
+  | May(f) -> 
+      (check p (MayTau(f)) nenv penv) || 
+      (check p (MayOut(f)) nenv penv) || 
+      (check p (MayInp(f)) nenv penv)
+  | All(f) ->
+      (check p (AllTau(f)) nenv penv) &&
+      (check p (AllOut(f)) nenv penv) &&
+      (check p (AllInp(f)) nenv penv)
+
+	(***)
+
+  | Exists(n,f) ->
+      let (domain,_) = create_domains p (Exists(n,f)) penv nenv in
+      iter_list_aux p n f nenv penv domain true
+  | ForAll(n,f) ->
+      let (domain,_) = create_domains p (ForAll(n,f)) penv nenv in
+      iter_list_aux p n f nenv penv domain false
+
+	(***)
+
+  | MaxFix(x,params,f,args) -> 
+      let (sf,nf_fns_aux,pvars) = subst (MaxFix(x,params,f,args)) nenv in
+      (match sf with
+	MaxFix(nx,nparams,nf,nargs) ->
+          (let nf_fns = domain_form nf_fns_aux pvars penv in
+	  let (template,marked) = arg_template nargs nf_fns (ref (Hashtbl.create 10)) in
+          Hashtbl.add !penv nx (ref [(ref (create_pset p marked),template)],nf,nparams,nf_fns,Max,ref 0);
+          let new_nenv = ref (Hashtbl.create 50) in
+          fixpoint_args new_nenv nparams nargs;
+          let res = check p nf new_nenv penv in
+          Hashtbl.remove !penv nx;
+          res)
+      |	_ -> raise Ill_formed_form)
+  | MinFix(x,params,f,args) ->
+      let (sf, nf_fns_aux,pvars) = subst (MinFix(x,params,f,args)) nenv in
+      (match sf with
+	MinFix(nx,nparams,nf,nargs) ->
+          (let nf_fns = domain_form nf_fns_aux pvars penv in
+	  let (template,marked) = arg_template nargs nf_fns (ref (Hashtbl.create 10)) in
+          Hashtbl.add !penv nx (ref [(ref (create_pset p marked),template)],nf,nparams,nf_fns,Min,ref 0);
+          let new_nenv = ref (Hashtbl.create 50) in
+          fixpoint_args new_nenv nparams nargs;
+          let res = check p nf new_nenv penv in
+          Hashtbl.remove !penv nx;
+          res)
+      | _ -> raise Ill_formed_form) 
+  | PropVar(id,args) ->
+      let (p_set_l,form,params,supp,fix_t,counter) = Hashtbl.find !penv id in
+      let nargs = fixpoint_args_subst args nenv in
+      let aux = ref (!p_set_l) in
+      let not_done = ref true in
+      let marked_args = ref [] in
+      while !not_done && (List.length !aux > 0) do
+	let (p_set, template) = List.hd !aux in
+	let (found,marked) = 
+	  if List.length nargs <> List.length template then 
+	    (false,[])
+	  else
+	    match_template nargs template supp (ref (Hashtbl.create 10)) 
+	in
+	if not found then
+	  aux := List.tl !aux
+	else
+	  (not_done := false; marked_args := marked)
+      done;
+      if !not_done then
+	(let (template,marked) = arg_template nargs supp (ref (Hashtbl.create 10)) in
+	 let n_pset = ref (create_pset p marked) in
+	 p_set_l := (n_pset,template)::!p_set_l;
+	 incr counter;
+	 (if !trace_value then
+	   (print_string ("Unfolding...\n");flush stdout));
+         let new_nenv = ref (Hashtbl.create 50) in
+         fixpoint_args new_nenv params nargs;
+	 let res_check = check p form new_nenv penv in
+	 decr counter;
+	 (if (((not res_check) && (fix_t = Max)) 
+	    || (res_check && (fix_t = Min))) then 
+	   remove_from_pset !n_pset p marked);
+	 res_check)
+      else
+	(let (p_set, template) = List.hd !aux in
+	 if exists_congruent_n p !marked_args !p_set supp then
+	   ((if !trace_value then
+	     (print_string ("Found after "^
+			    (string_of_int (!counter))^" steps!\n"); flush stdout));
+	    match fix_t with
+	      Max -> true
+	    | Min -> false)
+	 else
+	   (add_to_pset !p_set p !marked_args;
+	    incr counter;
+	    (if !trace_value then
+	      (print_string ("Unfolding...\n");flush stdout));
+            let new_nenv = ref (Hashtbl.create 50) in
+            fixpoint_args new_nenv params nargs;
+	    let res_check = check p form new_nenv penv in
+	    decr counter;
+	    (if (((not res_check) && (fix_t = Max)) 
+	       || (res_check && (fix_t = Min))) then 
+	      remove_from_pset !p_set p !marked_args);
+	    res_check))
+
+	  (***)
+	  
+  | Eventually(f) ->
+      let x = fresh_pvar() in
+      check p (MinFix(x,[],Or(f,MayTau(PropVar(x,[]))),[])) nenv penv
+  | Always(f) ->
+      let x = fresh_pvar() in
+      check p (MaxFix(x,[],And(f,AllTau(PropVar(x,[]))),[])) nenv penv
+
+	  (***)
+
+  | Inside(f) ->
+      let p_res = ref p in
+      let i = ref (find_rests !p_res) in
+      while !i <> -1 do
+	p_res := rev_comps !p_res !i 0 (fresh_name());
+	i := find_rests !p_res
+      done;
+      check !p_res f nenv penv
+    
+	  (***)
+
+  | Show_f(f) ->
+      let res = check p f nenv penv in
+      if not res then
+	(print_string "\n> FAILS: The following process <\n"; 
+	 print_process p;
+	 print_string "> does not satisfy ";
+	 print_form_subst f nenv;
+	 print_string " <\n";
+	 incr show_counter;
+	 print_string "> Number of hits: "; 
+	 print_int !show_counter;
+	 print_string " <\n(press return to continue)";
+	 let s = read_line() in
+	 ignore s);
+      res
+  | Show_s(f) ->
+      let res = check p f nenv penv in
+      if res then
+	(print_string "\n> SUCCEEDS: The following process <\n"; 
+	 print_process p;
+	 print_string "> satisfies ";
+	 print_form_subst f nenv;
+	 print_string " <\n";
+	 incr show_counter;
+	 print_string "> Number of hits: "; 
+	 print_int !show_counter;
+	 print_string " <\n(press return to continue)";
+	 let s = read_line() in
+	 ignore s);
+      res
+
+	(***)
+
+  | Abbrev(_) ->
+      raise Ill_formed_form
+
+(* Auxiliar function that handles composition iteration *)
+
+and comp_aux p f1 f2 nenv penv flag = 
+  let comp_it = comp p in
+  let res = ref false in
+  (try
+    while not !res do
+      let (p1,p2) = next_comp comp_it in
+      if flag then
+	(if (check p1 f1 nenv penv) && (check p2 f2 nenv penv) then
+	  res := true)
+      else
+	(if (not (check p1 f1 nenv penv)) && (not (check p2 f2 nenv penv)) then
+	  res := true)
+    done;
+  with No_more_comps -> ignore "");
+  !res
+
+(* Auxiliar function that handles revelation iteration *)
+
+and reveal_aux p n f nenv penv flag =
+  let rev_it = reveal p n in
+  let res = ref false in
+  (try
+    while not !res do
+      let proc = next_reveal rev_it in
+      if flag then
+	(if check proc f nenv penv then
+	  res := true)
+      else
+	(if not (check proc f nenv penv) then
+	  res := true)
+    done;
+  with No_more_reveals -> ignore "");
+  !res      
+
+(* Auxiliar functions that handle the behavioral iterators *)
+
+and next_aux p it f nenv penv flag =
+  let res = ref false in
+  (try 
+    while not !res do
+      let proc = next_react it in
+      if flag then
+	(if check proc f nenv penv then
+	  res := true)
+      else
+	(if not (check proc f nenv penv) then
+	  res := true)
+    done;
+  with No_more_reacts -> ignore "");
+  !res
+
+and may_iter_obj_aux p n f nenv penv domain lens = 
+  match lens with
+    [] -> false
+  | hd::tl -> 
+      let res = 
+	if hd = 0 then
+	  (may_iter_obj_args_aux p n f nenv penv [] 0 [])
+	else
+	  (may_iter_obj_lens_aux p n f nenv penv domain domain hd [])
+      in
+      if res then
+	true
+      else
+	may_iter_obj_aux p n f nenv penv domain tl
+
+and may_iter_obj_lens_aux p n f nenv penv dom1 dom2 len args =
+  match dom1 with 
+    [] -> false
+  | hd::tl ->
+      if may_iter_obj_args_aux p n f nenv penv dom2 (len-1) (hd::args) then
+	true 
+      else
+	may_iter_obj_lens_aux p n f nenv penv tl dom2 len args
+
+and may_iter_obj_args_aux p n f nenv penv dom len args =	
+  if len = 0 then
+    (let lab = Lab(Inp_type,n,args) in
+    let lab_it = react p lab in
+    next_aux p lab_it f nenv penv true)
+  else
+    may_iter_obj_lens_aux p n f nenv penv dom dom len args
+
+and all_iter_obj_aux p n f nenv penv domain lens = 
+  match lens with
+    [] -> true
+  | hd::tl -> 
+      let res = 
+	if hd = 0 then
+	  (all_iter_obj_args_aux p n f nenv penv [] 0 [])
+	else
+	  (all_iter_obj_lens_aux p n f nenv penv domain domain hd [])
+      in
+      if not res then
+	false
+      else
+	all_iter_obj_aux p n f nenv penv domain tl
+
+and all_iter_obj_lens_aux p n f nenv penv dom1 dom2 len args =
+  match dom1 with 
+    [] -> true
+  | hd::tl ->
+      if not (all_iter_obj_args_aux p n f nenv penv dom2 (len-1) (hd::args)) then
+	false
+      else
+	all_iter_obj_lens_aux p n f nenv penv tl dom2 len args 
+
+and all_iter_obj_args_aux p n f nenv penv dom len args =	
+  if len = 0 then
+    (let lab = Lab(Inp_type,n,args) in
+    let lab_it = react p lab in
+    not (next_aux p lab_it f nenv penv false))
+  else
+    all_iter_obj_lens_aux p n f nenv penv dom dom len args 
+
+and may_iter_sub_aux p f nenv penv l obj =
   match l with
-  | [] -> []
-  | hd :: tl ->
-      (proc_name hd oldn newn marker rmarker pos) ::
-        (proc_nameL tl oldn newn marker rmarker pos);;
-let proc_act act oldn newn marker rmarker pos fnsub =
-  {
-    t = act.t;
-    sub =
-      if fnsub
-      then act.sub
-      else proc_name act.sub oldn newn marker rmarker pos;
-    obj =
-      if act.t = Out_type
-      then proc_nameL act.obj oldn newn marker rmarker pos
-      else act.obj;
-    cont = act.cont;
-    args = proc_nameL act.args oldn newn marker rmarker pos;
-  };;
-let proc_test test oldn newn marker rmarker pos =
-  {
-    tst = test.tst;
-    idl = proc_name test.idl oldn newn marker rmarker pos;
-    idr = proc_name test.idr oldn newn marker rmarker pos;
-    tcont = test.tcont;
-    targs = proc_nameL test.targs oldn newn marker rmarker pos;
-  };;
-let proc_tau tau oldn newn marker rmarker pos =
-  {
-    tau_cont = tau.tau_cont;
-    tau_args = proc_nameL tau.tau_args oldn newn marker rmarker pos;
-  };;
-let proc_acts comp marker oldn revn start_act rmarker start_outs start_inps
-              start_tests start_taus start_sums inp_ind out_ind fn ti taui =
-  let outs = ref start_outs in
-  let accum = ref start_act
-  in
-    (for i = 0 to !comp.nfnouts - 1 do
-       if (not fn) || (out_ind <> i)
-       then
-         outs :=
-           ((proc_act !comp.fn_outs.(i) oldn revn marker rmarker (!accum + i)
-               true),
-            (!accum + i)) :: !outs
-       else decr accum
-     done;
-     accum := !accum + !comp.nfnouts;
-     for i = 0 to !comp.nbnouts - 1 do
-       if fn || (out_ind <> i)
-       then
-         outs :=
-           ((proc_act !comp.bn_outs.(i) oldn revn marker rmarker (!accum + i)
-               false),
-            (!accum + i)) :: !outs
-       else decr accum
-     done;
-     accum := !accum + !comp.nbnouts;
-     let inps = ref start_inps
-     in
-       (for i = 0 to !comp.nfninps - 1 do
-          if (not fn) || (inp_ind <> i)
-          then
-            inps :=
-              ((proc_act !comp.fn_inps.(i) oldn revn marker rmarker
-                  (!accum + i) true),
-               (!accum + i)) :: !inps
-          else decr accum
-        done;
-        accum := !accum + !comp.nfninps;
-        for i = 0 to !comp.nbninps - 1 do
-          if fn || (inp_ind <> i)
-          then
-            inps :=
-              ((proc_act !comp.bn_inps.(i) oldn revn marker rmarker
-                  (!accum + i) false),
-               (!accum + i)) :: !inps
-          else decr accum
-        done;
-        accum := !accum + !comp.nbninps;
-        let tests = ref start_tests
-        in
-          (for i = 0 to !comp.ntests - 1 do
-             if i <> ti
-             then
-               tests :=
-                 ((proc_test !comp.id_tests.(i) oldn revn marker rmarker
-                     (!accum + i)),
-                  (!accum + i)) :: !tests
-             else decr accum
-           done;
-           accum := !accum + !comp.ntests;
-           let taus = ref start_taus
-           in
-             (for i = 0 to !comp.ntaus - 1 do
-                if i <> taui
-                then
-                  taus :=
-                    ((proc_tau !comp.act_taus.(i) oldn revn marker rmarker
-                        (!accum + i)),
-                     (!accum + i)) :: !taus
-                else decr accum
-              done;
-              accum := !accum + !comp.ntaus;
-              let sums = ref start_sums in
-              let inp_sum_i =
-                ref (if fn then !comp.nfninps else !comp.nbninps) in
-              let out_sum_i =
-                ref (if fn then !comp.nfnouts else !comp.nbnouts) in
-              let test_sum_i = ref !comp.ntests in
-              let tau_sum_i = ref !comp.ntaus
-              in
-                (List.iter
-                   (fun l ->
-                      match l with
-                      | (acts, taus, tests) ->
-                          if
-                            ((inp_ind >= !inp_sum_i) &&
-                               (inp_ind < (!inp_sum_i + (List.length acts))))
-                              ||
-                              (((out_ind >= !out_sum_i) &&
-                                  (out_ind <
-                                     (!out_sum_i + (List.length acts))))
-                                 ||
-                                 (((taui >= !tau_sum_i) &&
-                                     (taui <
-                                        (!tau_sum_i + (List.length taus))))
-                                    ||
-                                    ((ti >= !test_sum_i) &&
-                                       (ti <
-                                          (!test_sum_i + (List.length tests))))))
-                          then
-                            (inp_sum_i := !inp_sum_i + (List.length acts);
-                             out_sum_i := !out_sum_i + (List.length acts);
-                             tau_sum_i := !tau_sum_i + (List.length taus);
-                             test_sum_i := !test_sum_i + (List.length tests))
-                          else
-                            (inp_sum_i := !inp_sum_i + (List.length acts);
-                             out_sum_i := !out_sum_i + (List.length acts);
-                             tau_sum_i := !tau_sum_i + (List.length taus);
-                             test_sum_i := !test_sum_i + (List.length tests);
-                             (let new_acts = ref []
-                              in
-                                (List.iter
-                                   (fun act ->
-                                      new_acts :=
-                                        (proc_act act oldn revn marker
-                                           rmarker !accum false) ::
-                                          !new_acts)
-                                   acts;
-                                 let new_taus = ref []
-                                 in
-                                   (List.iter
-                                      (fun tau ->
-                                         new_taus :=
-                                           (proc_tau tau oldn revn marker
-                                              rmarker !accum) ::
-                                             !new_taus)
-                                      taus;
-                                    let new_tests = ref []
-                                    in
-                                      (List.iter
-                                         (fun test ->
-                                            new_tests :=
-                                              (proc_test test oldn revn
-                                                 marker rmarker !accum) ::
-                                                !new_tests)
-                                         tests;
-                                       sums :=
-                                         (((!new_acts), (!new_taus),
-                                           (!new_tests)),
-                                          (!accum)) :: !sums;
-                                       incr accum))))))
-                   !comp.act_sums;
-                 (outs, inps, tests, taus, sums))))));;
-(* Restring name update handling *)
-let proc_rests comp_names num_comps comp pos res_names start_pos =
-  for i = 0 to !comp.nrests - 1 do
-    let new_rest_pos =
-      if i < pos then i else if i < (!comp.nrests - 1) then i + 1 else (-1)
+    [] -> false
+  | hd::tl ->
+      let lens = get_num_args p hd in
+      if may_iter_obj_aux p hd f nenv penv obj lens then
+	true
+      else
+	may_iter_sub_aux p f nenv penv tl obj
+
+and all_iter_sub_aux p f nenv penv l obj =
+  match l with
+    [] -> true
+  | hd::tl ->
+      let lens = get_num_args p hd in
+      if not (all_iter_obj_aux p hd f nenv penv obj lens) then
+	false
+      else
+	all_iter_sub_aux p f nenv penv tl obj
+
+(* Auxiliar function that handles name quantification iterators *)
+
+and iter_list_aux p n f nenv penv l flag = 
+  match l with
+    [] -> not flag
+  | hd::tl -> 
+      Hashtbl.add (!nenv) n hd;
+      let res = check p f nenv penv in
+      Hashtbl.remove (!nenv) n;
+      if flag && res then
+	true
+      else if (not flag) && (not res) then
+	false
+      else
+	iter_list_aux p n f nenv penv tl flag
+
+(***)
+
+(*** Calls the model checking procedure given a formula and a process identifier and arguments ***)
+
+let top_check arg =
+  match arg with (p_id,p_args,f) ->
+    let nf = 
+      try 
+	Hashtbl.find !procs p_id 
+      with Not_found -> raise (Equations.UndeclaredId p_id)
     in
-      if (new_rest_pos <> (-1)) && (comp_names.(i + start_pos) <> 0)
-      then
-        res_names.(comp_names.(i + start_pos) - 1) <-
-          (Bname (get_string !comp.rests.(new_rest_pos))) ::
-            res_names.(comp_names.(i + start_pos) - 1)
-      else ()
-  done;;
+    (match nf with (_,_,_,pars) -> 
+      if (List.length p_args) <> (List.length pars) then
+	raise (Wrong_args (p_id^": Number of arguments and parameters differ!")));
+    (if (!trace_value) then
+      print_nf nf);
+    let proc = nf2process nf p_args in
+    (if (!trace_value) then
+      print_process proc);
+    let nenv = ref (Hashtbl.create 0) in
+    let prop = install_defprop f (nenv) in
+    (if (!trace_value) then
+      (print_string "\n*** PROPERTY ***\n";
+       print_form prop;
+       print_string "\n****************\n"));
+    print_string "\nProcessing...\n";
+    flush stdout;
+    show_counter := 0;
+    check_counter := 0;
+    let tstart = Sys.time() in
+    let r = check proc prop (ref (Hashtbl.create 50)) (ref (Hashtbl.create 20)) in
+    let elapsed = Sys.time() -. tstart in
+    (if (!show_time) then
+      (print_string "\n- Time elapsed: ";
+       print_float elapsed;
+       print_string " secs -\n"));
+    (if (!show_checkcounter) then
+      (print_string "\n- Number of state visits: "; 
+       print_int !check_counter;
+       print_string " -\n"));
+    print_string ("\n* Process "^p_id);
+    if List.length p_args > 0 then
+      (print_string "(";
+       print_names p_args;
+       print_string ")");
+    if r then
+      print_string " satisfies"
+    else
+      print_string " does not satisfy";
+    print_string " the formula ";
+    print_form f;
+    if (!trace_value) then
+      (print_string " *\n(press return to continue)";
+       let s = read_line() in
+       ignore s)
+    else
+      print_string " *\n"
+
 (***)
-(*** Returns a process where a restricted name revelation has taken place ***)
-let rev_comps p comp_num rest_num revn =
-  let comp = !p.comps.(comp_num) in
-  let oldn = get_string !comp.rests.(rest_num) in
-  let marker =
-    Array.make_matrix (count_acts_comp p comp_num) (!comp.nrests - 1) false in
-  let rmarker = ref (Hashtbl.create !comp.nrests)
-  in
-    (rest_marker comp 0 rest_num rmarker;
-     let (outs, inps, tests, taus, sums) =
-       proc_acts comp marker oldn revn 0 rmarker [] [] [] [] [] (-1) (-1)
-         true (-1) (-1) in
-     let (num_comps, comp_acts, comp_names) = comps marker in
-     let (fnoL, bnoL, fniL, bniL, id_ts, act_ts, act_ss) =
-       create_comps outs inps tests taus sums num_comps comp_acts in
-     let rL = Array.create num_comps []
-     in
-       (proc_rests comp_names num_comps comp rest_num rL 0;
-        instantiate_proc p num_comps comp_num rL fnoL bnoL fniL bniL id_ts
-          act_ts act_ss));;
+
+(*** Clears all declarations ***)
+
+let clear () =
+  Hashtbl.clear !astprocs;
+  printprocs := [];
+  ccprocs := [];
+  cdlspecs := [];
+  Hashtbl.clear !procs;
+  printforms := [];
+  Hashtbl.clear !forms
+
 (***)
-(* Auxiliar functions to find_label *)
-let match_name s n =
-  match n with | Bname x -> false | Fname x -> x = s | Iname i -> false;;
-let rec match_list sl nl marker i h =
-  match nl with
-  | [] -> (match sl with | [] -> (true, []) | s :: sltl -> (false, []))
-  | Bname n :: nltl ->
-      if marker.(i)
-      then
-        (match sl with
-         | [] -> (false, [])
-         | s :: sltl ->
-             let (res, resL) = match_list sltl nltl marker (i + 1) h
-             in
-               if res
-               then
-                 if not (Hashtbl.mem !h n)
-                 then
-                   (let ns = if s = "_" then fresh_name () else s
-                    in (Hashtbl.add !h n ns; (true, ((ns, n) :: resL))))
-                 else
-                   if (Hashtbl.find !h n) = s
-                   then (true, resL)
-                   else (false, [])
-               else (false, []))
-      else (false, [])
-  | Fname n :: nltl ->
-      (match sl with
-       | [] -> (false, [])
-       | s :: sltl ->
-           let (res, resL) = match_list sltl nltl marker (i + 1) h
-           in if res then (((s = n) || (s = "_")), resL) else (false, []))
-  | Iname i :: nltl -> (false, []);;
-let match_lab t sub obj act marker =
-  if t <> act.t
-  then (false, [])
+
+(*** Updates the trace parameter value ***)
+    
+let trace arg =
+  trace_value := arg
+
+(***)
+
+(*** Prints the trace parameter value ***)
+
+let trace_val () =
+  print_string ("\n- Trace option is ");
+  if (!trace_value) then
+    print_string "on -\n"
   else
-    if t = Inp_type
-    then
-      (((match_name sub act.sub) &&
-          ((List.length obj) = (List.length act.obj))),
-       [])
-    else
-      if
-        (match_name sub act.sub) &&
-          ((List.length obj) = (List.length act.obj))
-      then
-        match_list obj act.obj marker 0
-          (ref (Hashtbl.create (List.length obj)))
-      else (false, []);;
+    print_string "off -\n"
+
 (***)
-(*** Finds an action given the label and a starting point ***)
-let find_label p lab comp ind marker =
-  let not_found = ref true in
-  let reveals = ref [] in
-  let size1 = !p.n_comps in
-  let cur_comp = ref comp in
-  let cur_ind = ref ind
-  in
-    ((match lab with
-      | (t, sub, obj) ->
-          while (!cur_comp < size1) && !not_found do
-            let (size2, acts) =
-              if t = Inp_type
-              then
-                ((!(!p.comps.(!cur_comp)).nfninps),
-                 (ref !(!p.comps.(!cur_comp)).fn_inps))
-              else
-                ((!(!p.comps.(!cur_comp)).nfnouts),
-                 (ref !(!p.comps.(!cur_comp)).fn_outs))
-            in
-              (while (!cur_ind < size2) && !not_found do
-                 (let (res, resL) =
-                    match_lab t sub obj !acts.(!cur_ind) marker
-                  in
-                    if res
-                    then (not_found := false; reveals := resL)
-                    else incr cur_ind)
-                 done;
-               if !not_found
-               then
-                 (let sum_ind = ref (!cur_ind - size2)
-                  in
-                    try
-                      List.iter
-                        (fun sum ->
-                           match sum with
-                           | (acts, taus, tests) ->
-                               List.iter
-                                 (fun act ->
-                                    if !sum_ind = 0
-                                    then
-                                      (let (res, resL) =
-                                         match_lab t sub obj act marker
-                                       in
-                                         if res
-                                         then
-                                           (not_found := false;
-                                            reveals := resL;
-                                            raise Found)
-                                         else incr cur_ind)
-                                    else decr sum_ind)
-                                 acts)
-                        !(!p.comps.(!cur_comp)).act_sums
-                    with | Found -> ignore 1)
-               else ();
-               if !not_found then (incr cur_comp; cur_ind := 0) else ())
-            done);
-     ((!not_found), (!cur_comp), (!cur_ind), (!reveals)));;
-(***)
-(*** Finds a restricted name component ***)
-let find_rest p comp n =
-  let res = ref (-1) in
-  let i = ref 0
-  in
-    (while (!res = (-1)) && (!i < !(!p.comps.(comp)).nrests) do
-       if (get_string !(!p.comps.(comp)).rests.(!i)) = n
-       then res := !i
-       else incr i done;
-     !res);;
-(***)
-(*** Finds a component that holds restrictions ***)
-let find_rests p =
-  let res = ref (-1) in
-  let i = ref 0
-  in
-    (while (!res = (-1)) && (!i < !p.n_comps) do
-       if !(!p.comps.(!i)).nrests > 0 then res := !i else incr i done;
-     !res);;
-(***)
-(* Auxiliar functions to react_label *)
-let cut_comp p pos =
-  let res =
-    {
-      n_comps = !p.n_comps - 1;
-      comps = Array.create (!p.n_comps - 1) (ref (nil_component ()));
-      env = !p.env;
-      fns = !p.fns;
-    }
-  in
-    (for i = 0 to !p.n_comps - 2 do
-       if i < pos
-       then res.comps.(i) <- !p.comps.(i)
-       else res.comps.(i) <- !p.comps.(i + 1)
-     done;
-     ref res);;
-let cut_two_comps p pos1 pos2 =
-  let res =
-    {
-      n_comps = !p.n_comps - 2;
-      comps = Array.create (!p.n_comps - 2) (ref (nil_component ()));
-      env = !p.env;
-      fns = !p.fns;
-    } in
-  let min_pos = min pos1 pos2 in
-  let max_pos = max pos1 pos2
-  in
-    (for i = 0 to !p.n_comps - 3 do
-       if i < min_pos
-       then res.comps.(i) <- !p.comps.(i)
-       else
-         if i < (max_pos - 1)
-         then res.comps.(i) <- !p.comps.(i + 1)
-         else res.comps.(i) <- !p.comps.(i + 2)
-     done;
-     ref res);;
-let rec react_label_args inpL sub_args =
-  let aux = Array.of_list inpL
-  in
-    for i = 0 to (Array.length sub_args) - 1 do
-      match sub_args.(i) with
-      | Iname k -> sub_args.(i) <- Fname aux.(k)
-      | _ -> ignore i
-    done;;
-(* Handles the process update after the transition *)
-let react_label_aux p pos eq act args ind inp =
-  let comp = !p.comps.(pos) in
-  let marker =
-    Array.make_matrix (((count_acts eq) + (count_acts_comp p pos)) - 1)
-      ((count_rests eq) + !comp.nrests) false in
-  let sub_args = Array.of_list act.args
-  in
-    (react_label_args args sub_args;
-     let sub_rests = fresh_rests (count_rests eq) in
-     let rmarker = ref (Hashtbl.create !comp.nrests)
-     in
-       (rest_marker comp (count_rests eq) !comp.nrests rmarker;
-        let (os, is, tsts, ts, ss) =
-          eq_acts eq marker sub_args sub_rests 0 rmarker [] [] [] [] [] in
-        let freshn = fresh_name () in
-        let (inp_ind, out_ind) = if inp then (ind, (-1)) else ((-1), ind) in
-        let (outs, inps, tests, taus, sums) =
-          proc_acts comp marker freshn freshn (count_acts eq) rmarker 
-            !os !is !tsts !ts !ss inp_ind out_ind true (-1) (-1) in
-        let (num_comps, comp_acts, comp_names) = comps marker in
-        let (fnoL, bnoL, fniL, bniL, id_ts, act_ts, act_ss) =
-          create_comps outs inps tests taus sums num_comps comp_acts in
-        let rL = Array.create num_comps []
-        in
-          (eq_rests comp_names num_comps sub_rests (count_rests eq) rL 0;
-           proc_rests comp_names num_comps comp !comp.nrests rL
-             (count_rests eq);
-           instantiate_proc p num_comps pos rL fnoL bnoL fniL bniL id_ts
-             act_ts act_ss)));;
-(***)
-let rec get_pos_sum sum ind i =
-  match sum with
-  | [] -> raise Error
-  | hd :: tl -> if ind = i then hd else get_pos_sum tl ind (i + 1);;
-let rec get_act_sums sums ind i =
-  match sums with
-  | [] -> raise Error
-  | (acts, taus, tests) :: tl ->
-      if ind < ((List.length acts) + i)
-      then get_pos_sum acts ind i
-      else get_act_sums tl ind (i + (List.length acts));;
-(***)
-(*** Returns a process where a transition on a given label has taken place ***)
-let react_label lab pos ind p =
-  match lab with
-  | (t, sub, obj) ->
-      let (act, inp) =
-        if t = Inp_type
-        then
-          if ind < !(!p.comps.(pos)).nfninps
-          then ((!(!p.comps.(pos)).fn_inps.(ind)), true)
-          else
-            ((get_act_sums !(!p.comps.(pos)).act_sums
-                (ind - !(!p.comps.(pos)).nfninps) 0),
-             true)
-        else
-          if ind < !(!p.comps.(pos)).nfnouts
-          then ((!(!p.comps.(pos)).fn_outs.(ind)), false)
-          else
-            ((get_act_sums !(!p.comps.(pos)).act_sums
-                (ind - !(!p.comps.(pos)).nfnouts) 0),
-             false)
-      in
-        if is_void_eqvar act.cont
-        then
-          if !p.n_comps = 1
-          then
-            ref
-              {
-                n_comps = 1;
-                comps = Array.create 1 (ref (nil_component ()));
-                env = nil_env ();
-                fns = nil_fns ();
-              }
-          else cut_comp p pos
-        else
-          (let eq = Hashtbl.find !(!p.env) act.cont
-           in react_label_aux p pos eq act obj ind inp);;
-(***)
-(* Auxiliar functions to find_fn_tau and find_bn_tau *)
-let match_tau_name n1 n2 =
-  match n1 with
-  | Bname x ->
-      (match n2 with | Bname y -> x = y | Fname y -> false | Iname i -> false)
-  | Fname x ->
-      (match n2 with | Bname y -> false | Fname y -> x = y | Iname i -> false)
-  | Iname i -> false;;
-let match_tau inp out =
-  (inp.t = Inp_type) &&
-    ((out.t = Out_type) &&
-       ((match_tau_name inp.sub out.sub) &&
-          ((List.length inp.obj) = (List.length out.obj))));;
-let is_fn_act act = match act.sub with | Fname s -> true | _ -> false;;
-(***)
-(*** Finds a synchronization in a free name ***)
-let find_fn_tau p inpc inpi outc outi =
-  let not_found = ref true in
-  let inp_comp = ref inpc in
-  let inp_ind = ref inpi in
-  let out_comp = ref outc in
-  let out_ind = ref outi
-  in
-    (while (!inp_comp < !p.n_comps) && !not_found do
-       while (!inp_ind < !(!p.comps.(!inp_comp)).nfninps) && !not_found do
-         while (!out_comp < !p.n_comps) && !not_found do
-           while (!out_ind < !(!p.comps.(!out_comp)).nfnouts) && !not_found
-             do
-             if
-               match_tau !(!p.comps.(!inp_comp)).fn_inps.(!inp_ind)
-                 !(!p.comps.(!out_comp)).fn_outs.(!out_ind)
-             then not_found := false
-             else incr out_ind done;
-           if !not_found
-           then
-             (let out_sum_ind =
-                ref (!out_ind - !(!p.comps.(!out_comp)).nfnouts)
-              in
-                try
-                  List.iter
-                    (fun sum ->
-                       match sum with
-                       | (acts, taus, tests) ->
-                           List.iter
-                             (fun out ->
-                                if !out_sum_ind = 0
-                                then
-                                  (if (is_fn_act out) && (out.t = Out_type)
-                                   then
-                                     if
-                                       match_tau
-                                         !(!p.comps.(!inp_comp)).fn_inps.
-                                           (!inp_ind)
-                                         out
-                                     then (not_found := false; raise Found)
-                                     else ()
-                                   else ();
-                                   incr out_ind)
-                                else decr out_sum_ind)
-                             acts)
-                    !(!p.comps.(!out_comp)).act_sums
-                with | Found -> ignore 1)
-           else (); if !not_found then (incr out_comp; out_ind := 0) else ()
-           done;
-         if !not_found
-         then (incr inp_ind; out_comp := 0; out_ind := 0)
-         else () done;
-       if !not_found
-       then
-         (let inp_sum_ind =
-            ref (!inp_ind - !(!p.comps.(!inp_comp)).nfninps) in
-          let inp_sum_pos = ref 0
-          in
-            try
-              List.iter
-                (fun inp_sum ->
-                   match inp_sum with
-                   | (acts, taus, tests) ->
-                       (List.iter
-                          (fun inp ->
-                             if !inp_sum_ind = 0
-                             then
-                               (if (is_fn_act inp) && (inp.t = Inp_type)
-                                then
-                                  while
-                                    (!out_comp < !p.n_comps) && !not_found do
-                                    while
-                                      (!out_ind <
-                                         !(!p.comps.(!out_comp)).nfnouts)
-                                        && !not_found
-                                      do
-                                      if
-                                        match_tau inp
-                                          !(!p.comps.(!out_comp)).fn_outs.
-                                            (!out_ind)
-                                      then (not_found := false; raise Found)
-                                      else incr out_ind done;
-                                    if !not_found
-                                    then
-                                      (let out_sum_ind =
-                                         ref
-                                           (!out_ind -
-                                              !(!p.comps.(!out_comp)).nfnouts) in
-                                       let out_sum_pos = ref 0
-                                       in
-                                         List.iter
-                                           (fun out_sum ->
-                                              ((match out_sum with
-                                                | (acts, taus, tests) ->
-                                                    if
-                                                      (!inp_comp <> !out_comp)
-                                                        ||
-                                                        (!inp_sum_pos <>
-                                                           !out_sum_pos)
-                                                    then
-                                                      List.iter
-                                                        (fun out ->
-                                                           if
-                                                             !out_sum_ind = 0
-                                                           then
-                                                             (if
-                                                                (is_fn_act
-                                                                   out)
-                                                                  &&
-                                                                  (out.t =
-                                                                    Out_type)
-                                                              then
-                                                                if
-                                                                  match_tau
-                                                                    inp out
-                                                                then
-                                                                  (not_found :=
-                                                                    false;
-                                                                   raise
-                                                                    Found)
-                                                                else ()
-                                                              else ();
-                                                              incr out_ind)
-                                                           else
-                                                             decr out_sum_ind)
-                                                        acts
-                                                    else
-                                                      (let out_sum_len 
-                                                         = List.length acts
-                                                       in
-                                                         if
-                                                           !out_sum_ind >=
-                                                             out_sum_len
-                                                         then
-                                                           out_sum_ind :=
-                                                             !out_sum_ind -
-                                                               out_sum_len
-                                                         else
-                                                           (out_sum_ind := 0;
-                                                            out_ind :=
-                                                              !out_ind +
-                                                                out_sum_len)));
-                                               incr out_sum_pos))
-                                           !(!p.comps.(!out_comp)).act_sums)
-                                    else ();
-                                    if !not_found
-                                    then (incr out_comp; out_ind := 0)
-                                    else () done
-                                else ();
-                                incr inp_ind;
-                                out_comp := 0;
-                                out_ind := 0)
-                             else decr inp_sum_ind)
-                          acts;
-                        incr inp_sum_pos))
-                !(!p.comps.(!inp_comp)).act_sums
-            with | Found -> ignore 1)
-       else ();
-       if !not_found
-       then (incr inp_comp; inp_ind := 0; out_comp := 0; out_ind := 0)
-       else () done;
-     ((!not_found), (!inp_comp), (!inp_ind), (!out_comp), (!out_ind)));;
-(***)
-(*** Finds a synchronization in a bound name ***)
-let find_bn_tau p c inpi outi =
-  let not_found = ref true in
-  let comp = ref c in
-  let inp_ind = ref inpi in
-  let out_ind = ref outi
-  in
-    (while (!comp < !p.n_comps) && !not_found do
-       while (!inp_ind < !(!p.comps.(!comp)).nbninps) && !not_found do
-         while (!out_ind < !(!p.comps.(!comp)).nbnouts) && !not_found do
-           if
-             match_tau !(!p.comps.(!comp)).bn_inps.(!inp_ind)
-               !(!p.comps.(!comp)).bn_outs.(!out_ind)
-           then not_found := false
-           else incr out_ind done;
-         if !not_found
-         then
-           (let out_sum_ind = ref (!out_ind - !(!p.comps.(!comp)).nbnouts)
-            in
-              try
-                List.iter
-                  (fun sum ->
-                     match sum with
-                     | (acts, taus, tests) ->
-                         List.iter
-                           (fun out ->
-                              if !out_sum_ind = 0
-                              then
-                                (if
-                                   (not (is_fn_act out)) &&
-                                     (out.t = Out_type)
-                                 then
-                                   if
-                                     match_tau
-                                       !(!p.comps.(!comp)).bn_inps.(!inp_ind)
-                                       out
-                                   then (not_found := false; raise Found)
-                                   else ()
-                                 else ();
-                                 incr out_ind)
-                              else decr out_sum_ind)
-                           acts)
-                  !(!p.comps.(!comp)).act_sums
-              with | Found -> ignore 1)
-         else (); if !not_found then (incr inp_ind; out_ind := 0) else ()
-         done;
-       if !not_found
-       then
-         (let inp_sum_ind = ref (!inp_ind - !(!p.comps.(!comp)).nbninps) in
-          let inp_sum_pos = ref 0
-          in
-            try
-              List.iter
-                (fun inp_sum ->
-                   match inp_sum with
-                   | (acts, taus, tests) ->
-                       (List.iter
-                          (fun inp ->
-                             if !inp_sum_ind = 0
-                             then
-                               (if
-                                  (not (is_fn_act inp)) && (inp.t = Inp_type)
-                                then
-                                  while
-                                    (!out_ind < !(!p.comps.(!comp)).nbnouts)
-                                      && !not_found
-                                    do
-                                    if
-                                      match_tau inp
-                                        !(!p.comps.(!comp)).bn_outs.
-                                          (!out_ind)
-                                    then (not_found := false; raise Found)
-                                    else incr out_ind done
-                                else ();
-                                if
-                                  (not (is_fn_act inp)) &&
-                                    ((inp.t = Inp_type) && !not_found)
-                                then
-                                  (let out_sum_ind =
-                                     ref
-                                       (!out_ind -
-                                          !(!p.comps.(!comp)).nbnouts) in
-                                   let out_sum_pos = ref 0
-                                   in
-                                     List.iter
-                                       (fun out_sum ->
-                                          ((match out_sum with
-                                            | (acts, taus, tests) ->
-                                                if
-                                                  !inp_sum_pos <>
-                                                    !out_sum_pos
-                                                then
-                                                  List.iter
-                                                    (fun out ->
-                                                       if !out_sum_ind = 0
-                                                       then
-                                                         (if
-                                                            (not
-                                                               (is_fn_act out))
-                                                              &&
-                                                              (out.t =
-                                                                 Out_type)
-                                                          then
-                                                            if
-                                                              match_tau inp
-                                                                out
-                                                            then
-                                                              (not_found :=
-                                                                 false;
-                                                               raise Found)
-                                                            else ()
-                                                          else ();
-                                                          incr out_ind)
-                                                       else decr out_sum_ind)
-                                                    acts
-                                                else
-                                                  (let out_sum_len =
-                                                     List.length acts
-                                                   in
-                                                     if
-                                                       !out_sum_ind >=
-                                                         out_sum_len
-                                                     then
-                                                       out_sum_ind :=
-                                                         !out_sum_ind -
-                                                           out_sum_len
-                                                     else
-                                                       (out_sum_ind := 0;
-                                                        out_ind :=
-                                                          !out_ind +
-                                                            out_sum_len)));
-                                           incr out_sum_pos))
-                                       !(!p.comps.(!comp)).act_sums)
-                                else ();
-                                incr inp_ind;
-                                out_ind := 0)
-                             else decr inp_sum_ind)
-                          acts;
-                        incr inp_sum_pos))
-                !(!p.comps.(!comp)).act_sums
-            with | Found -> ignore 1)
-       else ();
-       if !not_found then (incr comp; inp_ind := 0; out_ind := 0) else ()
-       done;
-     ((!not_found), (!comp), (!inp_ind), (!out_ind)));;
-(***)
-(* Auxiliar function to react_tau_aux *)
-let rec react_tau_args inpL sub_args =
-  let aux = Array.of_list inpL
-  in
-    for i = 0 to (Array.length sub_args) - 1 do
-      match sub_args.(i) with
-      | Iname k -> sub_args.(i) <- aux.(k)
-      | _ -> ignore i
-    done;;
-(* Handles the process update after the synchronization *)
-let react_tau_aux p inp_c out_c inp_eq out_eq inp_act out_act inp_i out_i fn
-                  =
-  let inp_comp = !p.comps.(inp_c) in
-  let out_comp = !p.comps.(out_c) in
-  let (num_acts, num_rests) =
-    if inp_c <> out_c
-    then
-      ((((((count_acts inp_eq) + (count_acts out_eq)) +
-            (count_acts_comp p inp_c))
-           + (count_acts_comp p out_c))
-          - 2),
-       ((((count_rests inp_eq) + (count_rests out_eq)) + !inp_comp.nrests) +
-          !out_comp.nrests))
-    else
-      (((((count_acts inp_eq) + (count_acts out_eq)) +
-           (count_acts_comp p inp_c))
-          - 2),
-       (((count_rests inp_eq) + (count_rests out_eq)) + !inp_comp.nrests)) in
-  let marker = Array.make_matrix num_acts num_rests false in
-  let inp_sub_args = Array.of_list inp_act.args
-  in
-    (react_tau_args out_act.obj inp_sub_args;
-     let out_sub_args = Array.of_list out_act.args in
-     let inp_sub_rests = fresh_rests (count_rests inp_eq) in
-     let out_sub_rests = fresh_rests (count_rests out_eq) in
-     let rmarker = ref (Hashtbl.create (!inp_comp.nrests + !out_comp.nrests))
-     in
-       (rest_marker inp_comp ((count_rests inp_eq) + (count_rests out_eq))
-          !inp_comp.nrests rmarker;
-        if inp_c <> out_c
-        then
-          rest_marker out_comp
-            (((count_rests inp_eq) + (count_rests out_eq)) + !inp_comp.nrests)
-            !out_comp.nrests rmarker
-        else ();
-        let (os1, is1, tsts1, ts1, ss1) =
-          eq_acts inp_eq marker inp_sub_args inp_sub_rests 0 rmarker [] [] []
-            [] []
-        in
-          (if (count_rests out_eq) > 0
-           then
-             (let i = ref ((count_rests inp_eq) - 1)
-              in
-                while !i >= 0 do
-                  for j = 0 to (count_acts inp_eq) - 1 do
-                    marker.(j).(!i + (count_rests out_eq)) <- marker.(j).(!i)
-                  done; decr i done)
-           else ();
-           let (os2, is2, tsts2, ts2, ss2) =
-             eq_acts out_eq marker out_sub_args out_sub_rests
-               (count_acts inp_eq) rmarker !os1 !is1 !tsts1 !ts1 !ss1 in
-           let freshn = fresh_name () in
-           let start_act = (count_acts inp_eq) + (count_acts out_eq) in
-           let (outs, inps, tests, taus, sums) =
-             if inp_c <> out_c
-             then
-               (let (os3, is3, tsts3, ts3, ss3) =
-                  proc_acts inp_comp marker freshn freshn start_act rmarker
-                    !os2 !is2 !tsts2 !ts2 !ss2 inp_i (-1) fn (-1) (-1)
-                in
-                  proc_acts out_comp marker freshn freshn
-                    ((start_act + (count_acts_comp p inp_c)) - 1) rmarker
-                    !os3 !is3 !tsts3 !ts3 !ss3 (-1) out_i fn (-1) (-1))
-             else
-               proc_acts inp_comp marker freshn freshn start_act rmarker 
-                 !os2 !is2 !tsts2 !ts2 !ss2 inp_i out_i fn (-1) (-1) in
-           let (num_comps, comp_acts, comp_names) = comps marker in
-           let (fnoL, bnoL, fniL, bniL, id_ts, act_ts, act_ss) =
-             create_comps outs inps tests taus sums num_comps comp_acts in
-           let rL = Array.create num_comps []
-           in
-             (eq_rests comp_names num_comps out_sub_rests
-                (count_rests out_eq) rL 0;
-              eq_rests comp_names num_comps inp_sub_rests
-                (count_rests inp_eq) rL (count_rests out_eq);
-              let start_rests = (count_rests out_eq) + (count_rests inp_eq)
-              in
-                (proc_rests comp_names num_comps inp_comp !inp_comp.nrests rL
-                   start_rests;
-                 if inp_c <> out_c
-                 then
-                   (proc_rests comp_names num_comps out_comp !out_comp.nrests
-                      rL (start_rests + !inp_comp.nrests);
-                    instantiate_proc2 p num_comps inp_c out_c rL fnoL bnoL
-                      fniL bniL id_ts act_ts act_ss)
-                 else
-                   instantiate_proc p num_comps inp_c rL fnoL bnoL fniL bniL
-                     id_ts act_ts act_ss)))));;
-(***)
-(*** Returns a process where an internal transition has taken place ***)
-let react_tau inp_c inp_i out_c out_i fn p =
-  let (inp_act, out_act) =
-    if fn
-    then
-      ((if inp_i < !(!p.comps.(inp_c)).nfninps
-        then !(!p.comps.(inp_c)).fn_inps.(inp_i)
-        else
-          get_act_sums !(!p.comps.(inp_c)).act_sums
-            (inp_i - !(!p.comps.(inp_c)).nfninps) 0),
-       (if out_i < !(!p.comps.(out_c)).nfnouts
-        then !(!p.comps.(out_c)).fn_outs.(out_i)
-        else
-          get_act_sums !(!p.comps.(out_c)).act_sums
-            (out_i - !(!p.comps.(out_c)).nfnouts) 0))
-    else
-      ((if inp_i < !(!p.comps.(inp_c)).nbninps
-        then !(!p.comps.(inp_c)).bn_inps.(inp_i)
-        else
-          get_act_sums !(!p.comps.(inp_c)).act_sums
-            (inp_i - !(!p.comps.(inp_c)).nbninps) 0),
-       (if out_i < !(!p.comps.(out_c)).nbnouts
-        then !(!p.comps.(out_c)).bn_outs.(out_i)
-        else
-          get_act_sums !(!p.comps.(out_c)).act_sums
-            (out_i - !(!p.comps.(out_c)).nbnouts) 0)) in
-  let inp_eq =
-    if is_void_eqvar inp_act.cont
-    then nil_eq ()
-    else Hashtbl.find !(!p.env) inp_act.cont in
-  let out_eq =
-    if is_void_eqvar out_act.cont
-    then nil_eq ()
-    else Hashtbl.find !(!p.env) out_act.cont in
-  let void_conts =
-    ((count_rests inp_eq) = 0) &&
-      (((count_acts inp_eq) = 0) &&
-         (((count_rests out_eq) = 0) && ((count_acts out_eq) = 0)))
-  in
-    if
-      void_conts &&
-        (((!p.n_comps = 1) && ((count_acts_comp p 0) = 2)) ||
-           ((!p.n_comps = 2) &&
-              (((count_acts_comp p inp_c) = 1) &&
-                 ((count_acts_comp p out_c) = 1))))
-    then
-      ref
-        {
-          n_comps = 1;
-          comps = Array.create 1 (ref (nil_component ()));
-          env = nil_env ();
-          fns = nil_fns ();
-        }
-    else
-      if void_conts && ((inp_c = out_c) && ((count_acts_comp p inp_c) = 2))
-      then cut_comp p inp_c
+
+(*** Prints a process to stdout ***)
+
+let show_proc id =
+  print_string ("\n- Listing process "^id^" -\n");
+  if not (print_ccproc id !ccprocs) then
+     (if (not (print_proc id)) then
+         print_string ("* NOT FOUND! *\n\n")
       else
-        if
-          void_conts &&
-            (((count_acts_comp p inp_c) = 1) &&
-               ((count_acts_comp p out_c) = 1))
-        then cut_two_comps p inp_c out_c
-        else
-          react_tau_aux p inp_c out_c inp_eq out_eq inp_act out_act inp_i
-            out_i fn;;
-(***)
-(*** Returns the different number of arguments of communications in a given name ***)
-let get_num_args p n =
-  let h = Hashtbl.create 100 in
-  let res = ref []
-  in
-    (for i = 0 to !p.n_comps - 1 do
-       for j = 0 to !(!p.comps.(i)).nfninps - 1 do
-         (let len = List.length !(!p.comps.(i)).fn_inps.(j).obj
-          in
-            if
-              ((get_string !(!p.comps.(i)).fn_inps.(j).sub) = n) &&
-                (not (Hashtbl.mem h len))
-            then (res := len :: !res; Hashtbl.add h len true)
-            else ())
-       done;
-       List.iter
-         (fun sum ->
-            match sum with
-            | (acts, taus, tests) ->
-                List.iter
-                  (fun inp ->
-                     let len = List.length inp.obj
-                     in
-                       if
-                         ((inp.t = Inp_type) &&
-                            ((is_fn_act inp) && ((get_string inp.sub) = n)))
-                           && (not (Hashtbl.mem h len))
-                       then (res := len :: !res; Hashtbl.add h len true)
-                       else ())
-                  acts)
-         !(!p.comps.(i)).act_sums
-     done;
-     !res);;
-(***)
-(* Auxiliar function to find_test *)
-let match_id test =
-  match test.idl with
-  | Fname s1 ->
-      (match test.idr with
-       | Fname s2 ->
-           if test.tst = Equations.Equals_type
-           then s1 = s2
-           else not (s1 = s2)
-       | _ -> false)
-  | Bname s1 ->
-      (match test.idr with
-       | Bname s2 ->
-           if test.tst = Equations.Equals_type
-           then s1 = s2
-           else not (s1 = s2)
-       | _ -> false)
-  | Iname s1 -> false;;
-(*** Finds a test prefix ready to fire ***)
-let find_test p comp ind =
-  let s1 = !p.n_comps in
-  let found = ref false in
-  let tes_comp = ref comp in
-  let tes_ind = ref ind
-  in
-    (while (!tes_comp < s1) && (not !found) do
-       while (!tes_ind < !(!p.comps.(!tes_comp)).ntests) && (not !found) do
-         if match_id !(!p.comps.(!tes_comp)).id_tests.(!tes_ind)
-         then found := true
-         else incr tes_ind done;
-       if not !found
-       then
-         (let sum_ind = ref (!tes_ind - !(!p.comps.(!tes_comp)).ntests)
-          in
-            try
-              List.iter
-                (fun sum ->
-                   match sum with
-                   | (acts, taus, tests) ->
-                       List.iter
-                         (fun test ->
-                            if !sum_ind = 0
-                            then
-                              if match_id test
-                              then (found := true; raise Found)
-                              else incr tes_ind
-                            else decr sum_ind)
-                         tests)
-                !(!p.comps.(!tes_comp)).act_sums
-            with | Found -> ignore 1)
-       else (); if not !found then (incr tes_comp; tes_ind := 0) else () done;
-     ((!found), (!tes_comp), (!tes_ind)));;
-(***)
-(* Handles the process update after the ttest firing transition *)
-let react_test_aux p pos ind eq test =
-  let comp = !p.comps.(pos) in
-  let marker =
-    Array.make_matrix (((count_acts eq) + (count_acts_comp p pos)) - 1)
-      ((count_rests eq) + !comp.nrests) false in
-  let sub_args = Array.of_list test.targs in
-  let sub_rests = fresh_rests (count_rests eq) in
-  let rmarker = ref (Hashtbl.create !comp.nrests)
-  in
-    (rest_marker comp (count_rests eq) !comp.nrests rmarker;
-     let (os, is, tsts, ts, ss) =
-       eq_acts eq marker sub_args sub_rests 0 rmarker [] [] [] [] [] in
-     let freshn = fresh_name () in
-     let (outs, inps, tests, taus, sums) =
-       proc_acts comp marker freshn freshn (count_acts eq) rmarker !os 
-         !is !tsts !ts !ss (-1) (-1) true ind (-1) in
-     let (num_comps, comp_acts, comp_names) = comps marker in
-     let (fnoL, bnoL, fniL, bniL, id_ts, act_ts, inp_ss) =
-       create_comps outs inps tests taus sums num_comps comp_acts in
-     let rL = Array.create num_comps []
-     in
-       (eq_rests comp_names num_comps sub_rests (count_rests eq) rL 0;
-        proc_rests comp_names num_comps comp !comp.nrests rL (count_rests eq);
-        instantiate_proc p num_comps pos rL fnoL bnoL fniL bniL id_ts act_ts
-          inp_ss));;
-(***)
-(* Auxiliar function to react_test *)
-let rec get_test_sums sums ind i =
-  match sums with
-  | [] -> raise Error
-  | (acts, taus, tests) :: tl ->
-      if ind < ((List.length tests) + i)
-      then get_pos_sum tests ind i
-      else get_test_sums tl ind (i + (List.length tests));;
-(*** Returns a process where a test firing transition has taken place ***)
-let react_test pos ind p =
-  let test =
-    if ind < !(!p.comps.(pos)).ntests
-    then !(!p.comps.(pos)).id_tests.(ind)
-    else
-      get_test_sums !(!p.comps.(pos)).act_sums
-        (ind - !(!p.comps.(pos)).ntests) 0
-  in
-    if
-      (is_void_eqvar test.tcont) &&
-        ((!p.n_comps = 1) && ((count_acts_comp p pos) = 1))
-    then
-      ref
-        {
-          n_comps = 1;
-          comps = Array.create 1 (ref (nil_component ()));
-          env = nil_env ();
-          fns = nil_fns ();
-        }
-    else
-      if (is_void_eqvar test.tcont) && ((count_acts_comp p pos) = 1)
-      then cut_comp p pos
-      else
-        (let test_eq =
-           if is_void_eqvar test.tcont
-           then nil_eq ()
-           else Hashtbl.find !(!p.env) test.tcont
-         in react_test_aux p pos ind test_eq test);;
-(***)
-(*** Finds a tau prefix ***)
-let find_tau_pref p comp ind =
-  let s1 = !p.n_comps in
-  let found = ref false in
-  let tau_comp = ref comp in
-  let tau_ind = ref ind
-  in
-    (while (!tau_comp < s1) && (not !found) do
-       if (!tau_ind < !(!p.comps.(!tau_comp)).ntaus) && (not !found)
-       then found := true
-       else ();
-       if not !found
-       then
-         (let sum_ind = ref (!tau_ind - !(!p.comps.(!tau_comp)).ntaus)
-          in
-            try
-              List.iter
-                (fun sum ->
-                   match sum with
-                   | (acts, taus, tests) ->
-                       List.iter
-                         (fun tau ->
-                            if !sum_ind = 0
-                            then (found := true; raise Found)
-                            else decr sum_ind)
-                         taus)
-                !(!p.comps.(!tau_comp)).act_sums
-            with | Found -> ignore 1)
-       else (); if not !found then (incr tau_comp; tau_ind := 0) else () done;
-     ((!found), (!tau_comp), (!tau_ind)));;
-(***)
-(* Auxiliar function to react_tau_pref *)
-let rec get_tau_sums sums ind i =
-  match sums with
-  | [] -> raise Error
-  | (acts, taus, tests) :: tl ->
-      if ind < ((List.length taus) + i)
-      then get_pos_sum taus ind i
-      else get_tau_sums tl ind (i + (List.length taus));;
-(***)
-(* Handles the process update after the a tau prefix firing *)
-let react_tau_pref_aux p pos ind eq tau =
-  let comp = !p.comps.(pos) in
-  let marker =
-    Array.make_matrix (((count_acts eq) + (count_acts_comp p pos)) - 1)
-      ((count_rests eq) + !comp.nrests) false in
-  let sub_args = Array.of_list tau.tau_args in
-  let sub_rests = fresh_rests (count_rests eq) in
-  let rmarker = ref (Hashtbl.create !comp.nrests)
-  in
-    (rest_marker comp (count_rests eq) !comp.nrests rmarker;
-     let (os, is, tsts, ts, ss) =
-       eq_acts eq marker sub_args sub_rests 0 rmarker [] [] [] [] [] in
-     let freshn = fresh_name () in
-     let (outs, inps, tests, taus, sums) =
-       proc_acts comp marker freshn freshn (count_acts eq) rmarker !os 
-         !is !tsts !ts !ss (-1) (-1) true (-1) ind in
-     let (num_comps, comp_acts, comp_names) = comps marker in
-     let (fnoL, bnoL, fniL, bniL, id_ts, act_ts, inp_ss) =
-       create_comps outs inps tests taus sums num_comps comp_acts in
-     let rL = Array.create num_comps []
-     in
-       (eq_rests comp_names num_comps sub_rests (count_rests eq) rL 0;
-        proc_rests comp_names num_comps comp !comp.nrests rL (count_rests eq);
-        instantiate_proc p num_comps pos rL fnoL bnoL fniL bniL id_ts act_ts
-          inp_ss));;
-(***)
-(*** Returns a process where a tau prefix firing transition has taken place ***)
-let react_tau_pref pos ind p =
-  let tau =
-    if ind < !(!p.comps.(pos)).ntaus
-    then !(!p.comps.(pos)).act_taus.(ind)
-    else
-      get_tau_sums !(!p.comps.(pos)).act_sums (ind - !(!p.comps.(pos)).ntaus)
-        0
-  in
-    if
-      (is_void_eqvar tau.tau_cont) &&
-        ((!p.n_comps = 1) && ((count_acts_comp p pos) = 1))
-    then
-      ref
-        {
-          n_comps = 1;
-          comps = Array.create 1 (ref (nil_component ()));
-          env = nil_env ();
-          fns = nil_fns ();
-        }
-    else
-      if (is_void_eqvar tau.tau_cont) && ((count_acts_comp p pos) = 1)
-      then cut_comp p pos
-      else
-        (let tau_eq =
-           if is_void_eqvar tau.tau_cont
-           then nil_eq ()
-           else Hashtbl.find !(!p.env) tau.tau_cont
-         in react_tau_pref_aux p pos ind tau_eq tau);;
-(***)
-(*** Handles bound name output revelation ***)
-let find_new_pos p old_ncomps old_ind =
-  let res_comp = ref old_ncomps in
-  let res_ind = ref old_ind in
-  let i = ref (old_ncomps - 1) in
-  let found = ref false
-  in
-    (while (!i < !p.n_comps) && (not !found) do
-       if !res_ind < !(!p.comps.(!i)).nfnouts
-       then (found := true; res_comp := !i)
-       else ();
-       (let ind_aux = ref !res_ind
-        in
-          (if not !found
-           then
-             (try
-                List.iter
-                  (fun sum ->
-                     match sum with
-                     | (acts, taus, tests) ->
-                         if !ind_aux < (List.length acts)
-                         then (found := true; res_comp := !i; raise Found)
-                         else ind_aux := !ind_aux - (List.length acts))
-                  !(!p.comps.(!i)).act_sums
-              with | Found -> ignore 1)
-           else ();
-           if not !found
-           then (res_ind := !ind_aux - !(!p.comps.(!i)).nfnouts; incr i)
-           else ()))
-       done;
-     ((!res_comp), (!res_ind)));;
-(***)
-(* Auxiliar function to find_name and find_action *)
-let rec test_all l h =
-  match l with
-  | [] -> (true, [])
-  | Bname x :: tl ->
-      let (res, resL) = test_all tl h
-      in
-        if res
-        then
-          if not (Hashtbl.mem !h x)
-          then
-            (Hashtbl.add !h x true; (true, (((fresh_name ()), x) :: resL)))
-          else (true, resL)
-        else (false, [])
-  | Fname x :: tl -> test_all tl h
-  | Iname i :: tl -> (false, []);;
-(***)
-(*** Finds an action given the subject name ***)
-let find_name p name act_t name_c name_i =
-  let s1 = !p.n_comps in
-  let found = ref false in
-  let name_comp = ref name_c in
-  let name_ind = ref name_i in
-  let reveals = ref []
-  in
-    (while (!name_comp < s1) && (not !found) do
-       (let (s2, acts) =
-          if act_t = Inp_type
-          then
-            ((!(!p.comps.(!name_comp)).nfninps),
-             (ref !(!p.comps.(!name_comp)).fn_inps))
-          else
-            ((!(!p.comps.(!name_comp)).nfnouts),
-             (ref !(!p.comps.(!name_comp)).fn_outs))
-        in
-          (while (!name_ind < s2) && (not !found) do
-             found := name = (get_string !acts.(!name_ind).sub);
-             if !found && (act_t = Out_type)
-             then
-               (let (res, resL) =
-                  test_all !acts.(!name_ind).obj
-                    (ref (Hashtbl.create (List.length !acts.(!name_ind).obj)))
-                in if res then reveals := resL else found := false)
-             else (); if not !found then incr name_ind else () done;
-           if not !found
-           then
-             (let sum_ind = ref (!name_ind - s2)
-              in
-                try
-                  List.iter
-                    (fun sum ->
-                       match sum with
-                       | (acts, taus, tests) ->
-                           List.iter
-                             (fun act ->
-                                if !sum_ind = 0
-                                then
-                                  (if
-                                     (act_t = act.t) &&
-                                       ((is_fn_act act) &&
-                                          (name = (get_string act.sub)))
-                                   then
-                                     if act_t = Out_type
-                                     then
-                                       (let (res, resL) =
-                                          test_all act.obj
-                                            (ref
-                                               (Hashtbl.create
-                                                  (List.length act.obj)))
-                                        in
-                                          if res
-                                          then
-                                            (found := true;
-                                             reveals := resL;
-                                             raise Found)
-                                          else ())
-                                     else (found := true; raise Found)
-                                   else ();
-                                   incr name_ind)
-                                else decr sum_ind)
-                             acts)
-                    !(!p.comps.(!name_comp)).act_sums
-                with | Found -> ignore 1)
-           else ();
-           if not !found then (incr name_comp; name_ind := 0) else ()))
-       done;
-     ((!found), (!name_comp), (!name_ind), (!reveals)));;
-(***)
-(*** Finds an action given the action type ***)
-let find_action p act_t comp ind =
-  let s1 = !p.n_comps in
-  let found = ref false in
-  let act_comp = ref comp in
-  let act_ind = ref ind in
-  let reveals = ref []
-  in
-    (while (!act_comp < s1) && (not !found) do
-       (let (s2, acts) =
-          if act_t = Inp_type
-          then
-            ((!(!p.comps.(!act_comp)).nfninps),
-             (ref !(!p.comps.(!act_comp)).fn_inps))
-          else
-            ((!(!p.comps.(!act_comp)).nfnouts),
-             (ref !(!p.comps.(!act_comp)).fn_outs))
-        in
-          (while (!act_ind < s2) && (not !found) do
-             if act_t = Out_type
-             then
-               (let (res, resL) =
-                  test_all !acts.(!act_ind).obj
-                    (ref (Hashtbl.create (List.length !acts.(!act_ind).obj)))
-                in if res then (found := true; reveals := resL) else ())
-             else found := true; if not !found then incr act_ind else () done;
-           if not !found
-           then
-             (let sum_ind = ref (!act_ind - s2)
-              in
-                try
-                  List.iter
-                    (fun sum ->
-                       match sum with
-                       | (acts, taus, tests) ->
-                           List.iter
-                             (fun act ->
-                                if !sum_ind = 0
-                                then
-                                  (if (act_t = act.t) && (is_fn_act act)
-                                   then
-                                     if act_t = Out_type
-                                     then
-                                       (let (res, resL) =
-                                          test_all act.obj
-                                            (ref
-                                               (Hashtbl.create
-                                                  (List.length act.obj)))
-                                        in
-                                          if res
-                                          then
-                                            (found := true;
-                                             reveals := resL;
-                                             raise Found)
-                                          else ())
-                                     else (found := true; raise Found)
-                                   else ();
-                                   incr act_ind)
-                                else decr sum_ind)
-                             acts)
-                    !(!p.comps.(!act_comp)).act_sums
-                with | Found -> ignore 1)
-           else ();
-           if not !found then (incr act_comp; act_ind := 0) else ()))
-       done;
-     ((!found), (!act_comp), (!act_ind), (!reveals)));;
-(***)
-(* Auxiliar function to next_react_aux *)
-let rec name_to_string l =
-  match l with
-  | [] -> []
-  | hd :: tl -> (get_string hd) :: (name_to_string tl);;
-(***)
-(*** Returns a process where a transition on a subject name or action type has taken place ***)
-let next_react_aux p act_t comp ind =
-  if act_t = Inp_type
-  then
-    (let act =
-       if ind < !(!p.comps.(comp)).nfninps
-       then !(!p.comps.(comp)).fn_inps.(ind)
-       else
-         get_act_sums !(!p.comps.(comp)).act_sums
-           (ind - !(!p.comps.(comp)).nfninps) 0
-     in
-       react_label
-         (act_t, (get_string act.sub), (fresh_names (List.length act.obj) 0))
-         comp ind p)
+         print_newline())
   else
-    (let act =
-       if ind < !(!p.comps.(comp)).nfnouts
-       then !(!p.comps.(comp)).fn_outs.(ind)
-       else
-         get_act_sums !(!p.comps.(comp)).act_sums
-           (ind - !(!p.comps.(comp)).nfnouts) 0
-     in
-       react_label (act_t, (get_string act.sub), (name_to_string act.obj))
-         comp ind p);;
+    print_newline()
+
 (***)
-(***)
-(* Auxiliar function to congruent_n *)
-let rec cut_supp l supp fix =
-  match l with
-  | [] -> []
-  | hd :: tl ->
-      if (List.mem hd supp) || (List.mem hd fix)
-      then cut_supp tl supp fix
-      else hd :: (cut_supp tl supp fix);;
-(***)
-(* Auxiliar functions to is_cong_n_comp *)
-let test_nums c1 c2 =
-  (!c1.nrests = !c2.nrests) &&
-    ((!c1.nfnouts = !c2.nfnouts) &&
-       ((!c1.nbnouts = !c2.nbnouts) &&
-          ((!c1.nfninps = !c2.nfninps) &&
-             ((!c1.nbninps = !c2.nbninps) &&
-                ((!c1.ntests = !c2.ntests) && (!c1.nsums = !c2.nsums))))));;
-(* Handle name relations *)
-let rec cut_elem el l =
-  match l with
-  | [] -> []
-  | hd :: tl -> if el = hd then tl else hd :: (cut_elem el tl);;
-let rec related n1 n2 l =
-  match l with
-  | [] -> ([], (n1 = n2))
-  | (ns1, ns2) :: tl ->
-      if List.mem n1 ns1
-      then
-        if List.mem n2 ns2
-        then
-          if (List.length ns1) = 1
-          then ((([ n1 ], [ n2 ]) :: tl), true)
-          else
-            ((([ n1 ], [ n2 ]) :: ((cut_elem n1 ns1), (cut_elem n2 ns2)) ::
-               tl),
-             true)
-        else (((ns1, ns2) :: tl), false)
-      else
-        if List.mem n2 ns2
-        then (((ns1, ns2) :: tl), false)
-        else
-          (let (resL, res) = related n1 n2 tl in (((ns1, ns2) :: resL), res));;
-let relate_name n1 n2 fnames rests =
-  match n1 with
-  | Fname fn1 ->
-      (match n2 with
-       | Fname fn2 ->
-           let (resL, res) = related fn1 fn2 !fnames in (fnames := resL; res)
-       | _ -> false)
-  | Bname bn1 ->
-      (match n2 with
-       | Bname bn2 ->
-           let (resL, res) = related bn1 bn2 !rests in (rests := resL; res)
-       | _ -> false)
-  | Iname i -> (match n2 with | Iname k -> i = k | _ -> false);;
-let rec relate_nameL l1 l2 fnames rests =
-  match l1 with
-  | [] -> true
-  | hd :: tl ->
-      (relate_name hd (List.hd l2) fnames rests) &&
-        (relate_nameL tl (List.tl l2) fnames rests);;
-(* Handle sum comparison *)
-let rec sums2ks acts taus tests =
-  match acts with
-  | [] ->
-      (match taus with
-       | [] ->
-           (match tests with
-            | [] -> []
-            | hd :: tail -> (TestK hd) :: (sums2ks acts taus tail))
-       | hd :: tail -> (TauK hd) :: (sums2ks acts tail tests))
-  | hd :: tail -> (ActK hd) :: (sums2ks tail taus tests);;
-let select_sum_j nacts ntaus ntests i =
-  if i < nacts
-  then 0
-  else if (i - nacts) < ntaus then nacts else nacts + ntaus;;
-let top_sum_j nacts ntaus ntests i =
-  if i < nacts
-  then nacts
+
+(*** Prints a formula to stdout ***)
+
+let show_prop id =
+  print_string ("\n- Listing formula "^id^" -\n");
+  if not (print_prop id) then
+    print_string ("* NOT FOUND! *\n\n")
   else
-    if (i - nacts) < ntaus then nacts + ntaus else (nacts + ntaus) + ntests;;
-(* Determines if two actions are equivalent *)
-let rec is_cong_n_act k1 k2 fnames rests =
-  match k1 with
-  | ActK act1 ->
-      (match k2 with
-       | ActK act2 ->
-           if
-             ((List.length act1.obj) = (List.length act2.obj)) &&
-               ((act1.cont = act2.cont) &&
-                  ((act1.t = act2.t) &&
-                     ((List.length act1.args) = (List.length act2.args))))
-           then
-             (relate_name act1.sub act2.sub fnames rests) &&
-               ((relate_nameL act1.obj act2.obj fnames rests) &&
-                  (relate_nameL act1.args act2.args fnames rests))
-           else false
-       | _ -> false)
-  | TauK tau1 ->
-      (match k2 with
-       | TauK tau2 ->
-           if
-             (tau1.tau_cont = tau2.tau_cont) &&
-               ((List.length tau1.tau_args) = (List.length tau2.tau_args))
-           then relate_nameL tau1.tau_args tau2.tau_args fnames rests
-           else false
-       | _ -> false)
-  | TestK test1 ->
-      (match k2 with
-       | TestK test2 ->
-           if
-             (test1.tcont = test2.tcont) &&
-               ((List.length test1.targs) = (List.length test2.targs))
-           then
-             ((test1.idl = test2.idl) = (test1.idr = test2.idr)) &&
-               (relate_nameL test1.targs test2.targs fnames rests)
-           else false
-       | _ -> false)
-  | SumK sum1 ->
-      (match k2 with
-       | SumK sum2 ->
-           (match sum1 with
-            | (acts1, taus1, tests1) ->
-                (match sum2 with
-                 | (acts2, taus2, tests2) ->
-                     let size1acts = List.length acts1 in
-                     let size2acts = List.length acts2
-                     in
-                       if size1acts <> size2acts
-                       then false
-                       else
-                         (let sum_vec1 = Array.of_list acts1 in
-                          let sum_vec2 = Array.of_list acts2 in
-                          let corresp = Array.create size1acts (-1) in
-                          let marker = Array.create size2acts false in
-                          let i = ref 0 in
-                          let j = ref 0 in
-                          let backup_fnames =
-                            Array.create (size1acts + 1) [] in
-                          let backup_rests = Array.create (size2acts + 1) []
-                          in
-                            (backup_fnames.(0) <- !fnames;
-                             backup_rests.(0) <- !rests;
-                             let res = ref true
-                             in
-                               ((try
-                                   while !i < size1acts do
-                                     if
-                                       (not marker.(!j)) &&
-                                         (is_cong_n_act (ActK sum_vec1.(!i))
-                                            (ActK sum_vec2.(!j)) fnames rests)
-                                     then
-                                       (corresp.(!i) <- !j;
-                                        marker.(!j) <- true;
-                                        incr i;
-                                        backup_fnames.(!i) <- !fnames;
-                                        backup_rests.(!i) <- !rests;
-                                        j := 0)
-                                     else
-                                       if !j < (size1acts - 1)
-                                       then incr j
-                                       else
-                                         (while
-                                            (!j = (size1acts - 1)) &&
-                                              (!i > 0)
-                                            do fnames := backup_fnames.(!i);
-                                            rests := backup_rests.(!i);
-                                            decr i; j := corresp.(!i);
-                                            marker.(!j) <- false;
-                                            corresp.(!i) <- (-1) done;
-                                          if !i = 0
-                                          then raise False
-                                          else incr j)
-                                     done
-                                 with
-                                 | False ->
-                                     (fnames := backup_fnames.(0);
-                                      res := false));
-                                !res)))))
-       | _ -> false);;
-(* Auxiliar functions to is_cong_n_comp *)
-let select_act c i =
-  if i < !c.nfnouts
-  then ActK !c.fn_outs.(i)
+    print_newline()
+
+(***)
+
+(*** Updates the maxthreads parameter value ***)
+
+let def_maxthreads new_mt =
+  max_threads := new_mt
+
+(***)
+
+(*** Prints the maxthread parameter value ***)
+
+let show_maxthreads () =
+  print_string ("\n- Current value for max_threads is ");
+  print_int !max_threads;
+  print_string " -\n"
+
+(***)
+
+(*** Updates the checkcounter parameter value ***)
+
+let def_checkcounter arg =
+  show_checkcounter := arg
+
+(***)
+
+(*** Prints the checkcounter parameter value ***)
+
+let checkcounter_val () =
+  print_string ("\n- Parameter check_counter is ");
+  if (!show_checkcounter) then
+    print_string "on -\n"
   else
-    (let j = i - !c.nfnouts
-     in
-       if j < !c.nbnouts
-       then ActK !c.bn_outs.(j)
-       else
-         (let k = j - !c.nbnouts
-          in
-            if k < !c.nfninps
-            then ActK !c.fn_inps.(k)
-            else
-              (let m = k - !c.nfninps
-               in
-                 if m < !c.nbninps
-                 then ActK !c.bn_inps.(m)
-                 else
-                   (let n = m - !c.nbninps
-                    in
-                      if n < !c.ntests
-                      then TestK !c.id_tests.(n)
-                      else
-                        (let l = n - !c.ntests
-                         in
-                           if l < !c.ntaus
-                           then TauK !c.act_taus.(l)
-                           else SumK (List.nth !c.act_sums (l - !c.ntaus)))))));;
-let select_j c i =
-  if i < !c.nfnouts
-  then 0
+    print_string "off -\n"
+
+(***)
+
+(*** Updates the showtime parameter value ***)
+
+let def_showtime arg =
+  show_time := arg
+
+(***)
+
+(*** Prints the showtime parameter value ***)
+
+let showtime_val () =
+  print_string ("\n- Parameter show_time is ");
+  if (!show_time) then
+    print_string "on -\n"
   else
-    (let k = i - !c.nfnouts
-     in
-       if k < !c.nbnouts
-       then !c.nfnouts
-       else
-         (let n = k - !c.nbnouts
-          in
-            if n < !c.nfninps
-            then !c.nfnouts + !c.nbnouts
-            else
-              (let m = n - !c.nfninps
-               in
-                 if m < !c.nbninps
-                 then (!c.nfnouts + !c.nbnouts) + !c.nfninps
-                 else
-                   (let l = m - !c.nbninps
-                    in
-                      if l < !c.ntests
-                      then
-                        ((!c.nfnouts + !c.nbnouts) + !c.nfninps) + !c.nbninps
-                      else
-                        (let o = l - !c.ntests
-                         in
-                           if o < !c.ntaus
-                           then
-                             (((!c.nfnouts + !c.nbnouts) + !c.nfninps) +
-                                !c.nbninps)
-                               + !c.ntests
-                           else
-                             ((((!c.nfnouts + !c.nbnouts) + !c.nfninps) +
-                                 !c.nbninps)
-                                + !c.ntests)
-                               + !c.ntaus)))));;
-let top_j c i =
-  if i < !c.nfnouts
-  then !c.nfnouts
-  else
-    (let k = i - !c.nfnouts
-     in
-       if k < !c.nbnouts
-       then !c.nfnouts + !c.nbnouts
-       else
-         (let n = k - !c.nbnouts
-          in
-            if n < !c.nfninps
-            then (!c.nfnouts + !c.nbnouts) + !c.nfninps
-            else
-              (let m = n - !c.nfninps
-               in
-                 if m < !c.nbninps
-                 then ((!c.nfnouts + !c.nbnouts) + !c.nfninps) + !c.nbninps
-                 else
-                   (let l = m - !c.nbninps
-                    in
-                      if l < !c.ntests
-                      then
-                        (((!c.nfnouts + !c.nbnouts) + !c.nfninps) +
-                           !c.nbninps)
-                          + !c.ntests
-                      else
-                        (let o = l - !c.ntests
-                         in
-                           if o < !c.ntaus
-                           then
-                             ((((!c.nfnouts + !c.nbnouts) + !c.nfninps) +
-                                 !c.nbninps)
-                                + !c.ntests)
-                               + !c.ntaus
-                           else
-                             (((((!c.nfnouts + !c.nbnouts) + !c.nfninps) +
-                                  !c.nbninps)
-                                 + !c.ntests)
-                                + !c.ntaus)
-                               + !c.nsums)))));;
-(* Determines if two components are equivalent *)
-let is_cong_n_comp p1 p2 i j fnames =
-  let c1 = !p1.comps.(i) in
-  let c1_num_acts = count_acts_comp p1 i in
-  let c2 = !p2.comps.(j) in
-  let c2_num_acts = count_acts_comp p2 j
-  in
-    if not (test_nums c1 c2)
-    then false
-    else
-      (let rests =
-         ref
-           [ ((get_stringL (Array.to_list !c1.rests)),
-              (get_stringL (Array.to_list !c2.rests))) ] in
-       let corresp = Array.create c1_num_acts (-1) in
-       let marker = Array.create c2_num_acts false in
-       let i = ref 0 in
-       let j = ref (select_j c2 !i) in
-       let backup_fnames = Array.create (c1_num_acts + 1) [] in
-       let backup_rests = Array.create (c1_num_acts + 1) []
-       in
-         (backup_fnames.(0) <- !fnames;
-          backup_rests.(0) <- !rests;
-          let res = ref true
-          in
-            ((try
-                while !i < c1_num_acts do
-                  if
-                    (not marker.(!j)) &&
-                      (is_cong_n_act (select_act c1 !i) (select_act c2 !j)
-                         fnames rests)
-                  then
-                    (corresp.(!i) <- !j;
-                     marker.(!j) <- true;
-                     incr i;
-                     backup_fnames.(!i) <- !fnames;
-                     backup_rests.(!i) <- !rests;
-                     j := select_j c2 !i)
-                  else
-                    if !j < ((top_j c2 !i) - 1)
-                    then incr j
-                    else
-                      (while (!j = ((top_j c2 !i) - 1)) && (!i > 0) do
-                         fnames := backup_fnames.(!i);
-                         rests := backup_rests.(!i); decr i;
-                         j := corresp.(!i); marker.(!j) <- false;
-                         corresp.(!i) <- (-1) done;
-                       if !i = 0 then raise False else incr j)
-                  done
-              with | False -> (fnames := backup_fnames.(0); res := false));
-             !res)));;
-(* Auxiliar functions and variables to congruent_n *)
-let rec singles l l2 =
-  match l with | [] -> l2 | hd :: tl -> ([ hd ], [ hd ]) :: (singles tl l2);;
-let glob_supp = ref [];;
-let glob_fix = ref [];;
-let rec match_args args1 args2 el =
-  match args1 with
-  | [] -> [ el ]
-  | hd :: tl ->
-      ([ hd ], [ List.hd args2 ]) :: (match_args tl (List.tl args2) el);;
-(* Determines if two processes are equivalent *)
-let congruent_n val1 val2 =
-  match val1 with
-  | (p1, p1_args) ->
-      (match val2 with
-       | (p2, p2_args) ->
-           let supp = !glob_supp
-           in
-             if (num_comps p1) <> (num_comps p2)
-             then false
-             else
-               (let fn_p1 = free_names p1 in
-                let fn_p2 = free_names p2 in
-                let fn_p1_supp = cut_supp fn_p1 supp p1_args in
-                let fn_p2_supp = cut_supp fn_p2 supp p2_args
-                in
-                  if
-                    ((List.length fn_p1) <> (List.length fn_p2)) ||
-                      ((List.length fn_p1_supp) <> (List.length fn_p2_supp))
-                  then false
-                  else
-                    (let fixed =
-                       match_args p1_args p2_args (fn_p1_supp, fn_p2_supp) in
-                     let fnames = ref (singles supp fixed) in
-                     let corresp = Array.create (num_comps p1) (-1) in
-                     let marker = Array.create (num_comps p2) false in
-                     let backup_fnames = Array.create (1 + (num_comps p1)) []
-                     in
-                       (backup_fnames.(0) <- !fnames;
-                        let i = ref 0 in
-                        let j = ref 0 in
-                        let res = ref true
-                        in
-                          ((try
-                              while !i < (num_comps p1) do
-                                if
-                                  (not marker.(!j)) &&
-                                    (is_cong_n_comp p1 p2 !i !j fnames)
-                                then
-                                  (corresp.(!i) <- !j;
-                                   marker.(!j) <- true;
-                                   incr i;
-                                   backup_fnames.(!i) <- !fnames;
-                                   j := 0)
-                                else
-                                  if !j < ((num_comps p2) - 1)
-                                  then incr j
-                                  else
-                                    (while
-                                       (!j = ((num_comps p2) - 1)) &&
-                                         (!i > 0)
-                                       do fnames := backup_fnames.(!i);
-                                       decr i; j := corresp.(!i);
-                                       marker.(!j) <- false;
-                                       corresp.(!i) <- (-1) done;
-                                     if !i = 0 then raise False else incr j)
-                                done
-                            with | False -> res := false);
-                           !res)))));;
+    print_string "off -\n"
+
 (***)
-(* Hash function for processes *)
-let hash_comps p =
-  let res = ref 0 in
-  let hash_val = Hashtbl.hash "$x"
-  in
-    (for i = 0 to (num_comps p) - 1 do
-       (let comp = !p.comps.(i)
-        in
-          (for j = 0 to !comp.nfnouts - 1 do
-             res := (!res + !comp.fn_outs.(j).cont) + hash_val
-           done;
-           for j = 0 to !comp.nfninps - 1 do
-             res := (!res + !comp.fn_inps.(j).cont) + hash_val
-           done;
-           for j = 0 to !comp.nbnouts - 1 do
-             res := (!res + !comp.bn_outs.(j).cont) + hash_val
-           done;
-           for j = 0 to !comp.nbninps - 1 do
-             res := (!res + !comp.bn_inps.(j).cont) + hash_val
-           done;
-           for j = 0 to !comp.ntests - 1 do
-             res := (!res + !comp.id_tests.(j).tcont) + hash_val
-           done;
-           for j = 0 to !comp.ntaus - 1 do
-             res := (!res + !comp.act_taus.(j).tau_cont) + hash_val
-           done;
-           List.iter
-             (fun sum ->
-                match sum with
-                | (acts, taus, tests) ->
-                    (List.iter
-                       (fun act -> res := (!res + act.cont) + hash_val) acts;
-                     List.iter
-                       (fun tau -> res := (!res + tau.tau_cont) + hash_val)
-                       taus;
-                     List.iter
-                       (fun test -> res := (!res + test.tcont) + hash_val)
-                       tests))
-             !comp.act_sums))
-     done;
-     !res);;
-(***)
-(*** Top level process set type ***)
-module Process_hash =
-  struct
-    type t = (process * (string list));;
-    let equal p1 p2 = congruent_n p1 p2;;
-    let hash p =
-      match p with | (proc, l) -> (num_comps proc) * (hash_comps proc);;
-  end;;
-module Process_set = Hashtbl.Make(Process_hash);;
-type process_set = bool Process_set.t;;
-(*** Creates a process set ***)
-let create_pset p l =
-  let pset = Process_set.create 100
-  in (Process_set.add pset (p, l) true; pset);;
-(***)
-(*** Adds a process to a process set ***)
-let add_to_pset pset p l = Process_set.add pset (p, l) true;;
-(***)
-(*** Removes a process from a process set ***)
-let remove_from_pset pset p l = Process_set.remove pset (p, l);;
-(***)
-(*** Determines if there exists an equivalent process in the process set ***)
-let rec exists_congruent_n p l pset supp =
-  (glob_supp := supp;
-   let res = Process_set.mem pset (p, l) in (glob_supp := []; res));;
