@@ -1,7 +1,7 @@
 let q = <:str_item< let f x = x >>
 
-let q = <:ctyp< ('a, 'b) foo >>
+let q = <:ctyp< Foo | Bar | Baz of int>>
 
-let r = <:ctyp< 'a 'b foo >>
+let q = <:str_item< type q = Foo | Bar | Baz >>
 
-let t' = <:str_item< type t = Foo | Bar | Baz>>
+let r = <:str_item< type rcd = { mutable v: int; w: string; x: string }>>

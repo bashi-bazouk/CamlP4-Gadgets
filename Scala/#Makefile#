@@ -1,0 +1,10 @@
+.PHONY: test clean
+
+pr_scala.cmo: pr_scala.ml
+	ocamlc.opt -c -pp camlp4rf -I +camlp4 dynlink.cma camlp4lib.cma pr_scala.ml
+
+killall FileMerge
+	opendiff test.ml result.ml
+
+clean:
+	-rm *.cm[oi] *~ result.ml

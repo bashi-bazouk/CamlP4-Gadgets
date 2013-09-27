@@ -6,4 +6,4 @@ output: input.ml
 	cat output
 
 clean:
-	-rm output
+	-rm output *~

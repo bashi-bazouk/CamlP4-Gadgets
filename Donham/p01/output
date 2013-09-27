@@ -8,32 +8,40 @@ let q =
     (Ast.StNil _loc))
   
 let q =
-  Ast.TyApp (_loc,
-    (Ast.TyApp (_loc, (Ast.TyId (_loc, (Ast.IdLid (_loc, "foo")))),
-       (Ast.TyQuo (_loc, "a")))),
-    (Ast.TyQuo (_loc, "b")))
+  Ast.TyOr (_loc, (Ast.TyId (_loc, (Ast.IdUid (_loc, "Foo")))),
+    (Ast.TyOr (_loc, (Ast.TyId (_loc, (Ast.IdUid (_loc, "Bar")))),
+       (Ast.TyOf (_loc, (Ast.TyId (_loc, (Ast.IdUid (_loc, "Baz")))),
+          (Ast.TyId (_loc, (Ast.IdLid (_loc, "int")))))))))
   
-let r =
-  Ast.TyApp (_loc, (Ast.TyId (_loc, (Ast.IdLid (_loc, "foo")))),
-    (Ast.TyApp (_loc, (Ast.TyQuo (_loc, "b")), (Ast.TyQuo (_loc, "a")))))
-  
-let t =
+let q =
   Ast.StSem (_loc,
     (Ast.StTyp (_loc,
-       (Ast.TyDcl (_loc, "t", [], (Ast.TySum (_loc, (Ast.TySum (loc, ())))),
-          [])))),
-    (Ast.StNil _loc))
-  
-let t' =
-  Ast.StSem (_loc,
-    (Ast.StTyp (_loc,
-       (Ast.TyDcl (_loc, "t", [],
+       (Ast.TyDcl (_loc, "q", [],
           (Ast.TySum (_loc,
              (Ast.TyOr (_loc,
                 (Ast.TyOr (_loc,
                    (Ast.TyId (_loc, (Ast.IdUid (_loc, "Foo")))),
                    (Ast.TyId (_loc, (Ast.IdUid (_loc, "Bar")))))),
                 (Ast.TyId (_loc, (Ast.IdUid (_loc, "Baz")))))))),
+          [])))),
+    (Ast.StNil _loc))
+  
+let r =
+  Ast.StSem (_loc,
+    (Ast.StTyp (_loc,
+       (Ast.TyDcl (_loc, "rcd", [],
+          (Ast.TyRec (_loc,
+             (Ast.TySem (_loc,
+                (Ast.TyCol (_loc, (Ast.TyId (_loc, (Ast.IdLid (_loc, "v")))),
+                   (Ast.TyMut (_loc,
+                      (Ast.TyId (_loc, (Ast.IdLid (_loc, "int")))))))),
+                (Ast.TySem (_loc,
+                   (Ast.TyCol (_loc,
+                      (Ast.TyId (_loc, (Ast.IdLid (_loc, "w")))),
+                      (Ast.TyId (_loc, (Ast.IdLid (_loc, "string")))))),
+                   (Ast.TyCol (_loc,
+                      (Ast.TyId (_loc, (Ast.IdLid (_loc, "x")))),
+                      (Ast.TyId (_loc, (Ast.IdLid (_loc, "string")))))))))))),
           [])))),
     (Ast.StNil _loc))
   
